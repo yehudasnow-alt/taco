@@ -1,129 +1,147 @@
-import { Suspense, useRef, useMemo, useEffect } from 'react';
+import { useRef, useState, useEffect, useMemo } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
-import { OrbitControls, Stars, useTexture } from '@react-three/drei';
+import { OrbitControls, Stars } from '@react-three/drei';
 import * as THREE from 'three';
+
 import { latLngToVector3, createArcPoints } from '../utils/geo';
-import { getBorderGeometry } from '../utils/borders';
-import { useRouteStore } from '../store/routeStore';
-import { useAirports } from '../hooks/useAirports';
+import { getBorderGeometry }                from '../utils/borders';
+import { generateEarthTexture }             from '../utils/earthTexture';
+import { useRouteStore }                    from '../store/routeStore';
+import { useAirports }                      from '../hooks/useAirports';
 
-const TEX_DAY  = 'https://unpkg.com/three-globe/example/img/earth-day.jpg';
-const TEX_BUMP = 'https://unpkg.com/three-globe/example/img/earth-topology.png';
+// ── Tier-0: one major hub per country visible from max zoom-out (~50 airports) ─
+const TIER0 = new Set([
+  // Americas
+  'JFK','LAX','ORD','MIA','SFO','YYZ','MEX','GRU','EZE','SCL','LIM','BOG',
+  // Europe
+  'LHR','CDG','FRA','AMS','MAD','FCO','IST','VIE','ZRH','ARN','CPH','HEL',
+  'BCN','MUC','BRU','ATH','LIS','WAW','PRG','BUD','DUB','OTP',
+  // Middle East & Africa
+  'DXB','DOH','RUH','TLV','CAI','AMM','JNB','NBO','LOS','ADD','CMN','ACC','CPT',
+  // Asia-Pacific
+  'NRT','ICN','PEK','PVG','HKG','SIN','BKK','DEL','BOM','KUL','CGK','MNL','SGN',
+  'SYD','MEL','AKL',
+  // Russia / CIS
+  'SVO',
+]);
 
-// ─── Earth ────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Earth (vector canvas texture)
+// ─────────────────────────────────────────────────────────────────────────────
 function Earth() {
-  const [day, bump] = useTexture([TEX_DAY, TEX_BUMP]);
-  day.colorSpace = THREE.SRGBColorSpace;
+  const [tex, setTex] = useState(null);
+
+  useEffect(() => {
+    let live = true;
+    generateEarthTexture().then(t => { if (live) setTex(t); });
+    return () => { live = false; };
+  }, []);
+
   return (
     <group>
-      {/* Atmosphere glow */}
-      <mesh scale={1.06}>
+      {/* Atmosphere rim */}
+      <mesh scale={1.055}>
         <sphereGeometry args={[1, 32, 32]} />
-        <meshBasicMaterial color="#3a8fff" transparent opacity={0.06}
+        <meshBasicMaterial color="#4a9eff" transparent opacity={0.05}
           side={THREE.BackSide} depthWrite={false} />
       </mesh>
       {/* Globe */}
       <mesh>
         <sphereGeometry args={[1, 64, 64]} />
-        <meshStandardMaterial map={day} bumpMap={bump} bumpScale={0.04}
-          roughness={0.7} metalness={0} />
+        {tex
+          ? <meshStandardMaterial map={tex} roughness={0.6} metalness={0} />
+          : <meshBasicMaterial color={OCEAN_PLACEHOLDER} />}
       </mesh>
     </group>
   );
 }
+const OCEAN_PLACEHOLDER = '#bed8ec';
 
-function EarthFallback() {
-  return (
-    <mesh>
-      <sphereGeometry args={[1, 32, 32]} />
-      <meshBasicMaterial color="#0d2040" />
-    </mesh>
-  );
-}
-
-// ─── Country borders ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Country border lines (crisp 3-D overlay)
+// ─────────────────────────────────────────────────────────────────────────────
 function CountryBorders() {
   const geo = useMemo(() => getBorderGeometry(), []);
   return (
     <lineSegments geometry={geo}>
-      <lineBasicMaterial color="#88ccff" transparent opacity={0.22} />
+      <lineBasicMaterial color="#9a8f7a" transparent opacity={0.28} />
     </lineSegments>
   );
 }
 
-// ─── InstancedMesh airport dots — updates only when camera/state changes ──────
-const MAX_AIRPORTS = 2200;
-const TMP_OBJ   = new THREE.Object3D();
-const TMP_COLOR = new THREE.Color();
+// ─────────────────────────────────────────────────────────────────────────────
+// Airport dots (InstancedMesh — updates only when something changes)
+// ─────────────────────────────────────────────────────────────────────────────
+const MAX_INST = 2500;
+const _O = new THREE.Object3D();
+const _C = new THREE.Color();
 
-function AirportDots({ sorted, tier1End, stopIatas, hoveredAirport, onClick, onHover }) {
-  const meshRef  = useRef();
+function AirportDots({ sorted, t0end, t1end, stopIatas, hovered, onClick, onHover }) {
+  const ref    = useRef();
   const { camera } = useThree();
 
-  // Cache 3D positions once
-  const positions = useMemo(
-    () => sorted.map(ap => latLngToVector3(ap.lat, ap.lng, 1.014)),
+  // 3-D positions cached — only recalculated when airport list changes
+  const pos3d = useMemo(
+    () => sorted.map(a => latLngToVector3(a.lat, a.lng, 1.015)),
     [sorted]
   );
 
-  // Track previous state to skip no-op frames
-  const prev = useRef({ dist: 2.6, stops: null, hovered: null, count: -1 });
+  const prev = useRef({ dist: -1, stops: null, hov: null, cnt: -1 });
 
   useFrame(() => {
-    const mesh = meshRef.current;
-    if (!mesh || sorted.length === 0) return;
+    const mesh = ref.current;
+    if (!mesh || !sorted.length) return;
 
-    const dist    = camera.position.length();
-    const p       = prev.current;
-    const distDelta  = Math.abs(dist - p.dist);
-    const stopsChg   = stopIatas  !== p.stops;
-    const hoverChg   = hoveredAirport !== p.hovered;
-    const newCount   = dist > 2.75 ? tier1End : sorted.length;
-    const countChg   = newCount !== p.count;
+    const dist = camera.position.length();
+    const p    = prev.current;
 
-    if (distDelta < 0.02 && !stopsChg && !hoverChg && !countChg) return;
+    // LOD thresholds
+    const cnt = dist > 3.4 ? t0end
+              : dist > 2.55 ? t1end
+              : sorted.length;
 
-    // Dot size: constant screen-space appearance
-    const base = 0.013 * (dist / 2.6);
+    if (
+      Math.abs(dist - p.dist) < 0.012 &&
+      stopIatas === p.stops &&
+      hovered   === p.hov   &&
+      cnt       === p.cnt
+    ) return;
 
-    if (countChg) mesh.count = newCount;
+    // Dot size: constant apparent size on screen
+    const base = 0.0115 * (dist / 2.6);
+
+    if (cnt !== mesh.count) mesh.count = cnt;
 
     for (let i = 0; i < sorted.length; i++) {
-      const ap = sorted[i];
-      TMP_OBJ.position.copy(positions[i]);
-      TMP_OBJ.scale.setScalar(ap.tier === 1 ? base * 1.7 : base);
-      TMP_OBJ.updateMatrix();
-      mesh.setMatrixAt(i, TMP_OBJ.matrix);
+      const a = sorted[i];
+      _O.position.copy(pos3d[i]);
+      const isT0 = TIER0.has(a.iata);
+      _O.scale.setScalar(isT0 ? base * 1.9 : a.tier === 1 ? base * 1.2 : base * 0.75);
+      _O.updateMatrix();
+      mesh.setMatrixAt(i, _O.matrix);
 
-      const isStop = stopIatas.has(ap.iata);
-      const isHov  = hoveredAirport?.iata === ap.iata;
-      TMP_COLOR.set(isStop ? '#ff6b35' : isHov ? '#ffffff' : ap.tier === 1 ? '#4dd0e1' : '#4a9eff');
-      mesh.setColorAt(i, TMP_COLOR);
+      const isStop = stopIatas.has(a.iata);
+      const isHov  = hovered?.iata === a.iata;
+      _C.set(isStop ? '#ff6b35' : isHov ? '#ffffff'
+           : isT0   ? '#2dd4bf' : a.tier === 1 ? '#60a5fa' : '#93c5fd');
+      mesh.setColorAt(i, _C);
     }
 
     mesh.instanceMatrix.needsUpdate = true;
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
 
-    p.dist    = dist;
-    p.stops   = stopIatas;
-    p.hovered = hoveredAirport;
-    p.count   = newCount;
+    p.dist  = dist;
+    p.stops = stopIatas;
+    p.hov   = hovered;
+    p.cnt   = cnt;
   });
 
   return (
     <instancedMesh
-      ref={meshRef}
-      args={[null, null, MAX_AIRPORTS]}
-      onClick={e => {
-        e.stopPropagation();
-        const ap = sorted[e.instanceId];
-        if (ap) onClick(ap);
-      }}
-      onPointerMove={e => {
-        e.stopPropagation();
-        const ap = sorted[e.instanceId];
-        if (ap) onHover(ap);
-      }}
+      ref={ref}
+      args={[null, null, MAX_INST]}
+      onClick={e => { e.stopPropagation(); const a = sorted[e.instanceId]; if (a) onClick(a); }}
+      onPointerMove={e => { e.stopPropagation(); const a = sorted[e.instanceId]; if (a) onHover(a); }}
       onPointerLeave={() => onHover(null)}
     >
       <sphereGeometry args={[1, 8, 8]} />
@@ -132,139 +150,136 @@ function AirportDots({ sorted, tier1End, stopIatas, hoveredAirport, onClick, onH
   );
 }
 
-// ─── Route arc (half the previous height) ────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Animated dashed arc
+// ─────────────────────────────────────────────────────────────────────────────
 function RouteArc({ from, to }) {
-  const points  = useMemo(
-    () => createArcPoints(from.lat, from.lng, to.lat, to.lng, 120, 0.14), // 0.28 → 0.14
+  const pts = useMemo(
+    () => createArcPoints(from.lat, from.lng, to.lat, to.lng, 120, 0.14),
     [from, to]
   );
-  const geo    = useMemo(() => new THREE.BufferGeometry().setFromPoints(points), [points]);
+  const geo    = useMemo(() => new THREE.BufferGeometry().setFromPoints(pts), [pts]);
   const matRef = useRef();
-
   useFrame(() => { if (matRef.current) matRef.current.dashOffset -= 0.004; });
-
   return (
     <line geometry={geo}>
-      <lineDashedMaterial ref={matRef} color="#ff6b35" dashSize={0.055} gapSize={0.025}
-        transparent opacity={0.9} />
+      <lineDashedMaterial ref={matRef}
+        color="#ff6b35" dashSize={0.055} gapSize={0.025} transparent opacity={0.92} />
     </line>
   );
 }
 
-// ─── Inner scene (needs access to useThree) ───────────────────────────────────
-function Scene({ stops, addStop, setHoveredAirport, hoveredAirport }) {
-  const { airports, loading } = useAirports();
+// ─────────────────────────────────────────────────────────────────────────────
+// Scene (needs useThree, so must live inside Canvas)
+// ─────────────────────────────────────────────────────────────────────────────
+function Scene({ stops, addStop, setHovered, hovered, autoRotate }) {
+  const { airports } = useAirports();
   const stopIatas = useMemo(() => new Set(stops.map(s => s.iata)), [stops]);
 
-  // Sort tier1 first so LOD count works cleanly
-  const { sorted, tier1End } = useMemo(() => {
-    const t1 = airports.filter(a => a.tier === 1);
-    const t2 = airports.filter(a => a.tier !== 1);
-    return { sorted: [...t1, ...t2], tier1End: t1.length };
+  // Sort: tier0 first → large_airport → medium_airport
+  const { sorted, t0end, t1end } = useMemo(() => {
+    const t0 = airports.filter(a =>  TIER0.has(a.iata));
+    const t1 = airports.filter(a => !TIER0.has(a.iata) && a.tier === 1);
+    const t2 = airports.filter(a => !TIER0.has(a.iata) && a.tier !== 1);
+    return {
+      sorted: [...t0, ...t1, ...t2],
+      t0end:  t0.length,
+      t1end:  t0.length + t1.length,
+    };
   }, [airports]);
 
   return (
     <>
-      <ambientLight intensity={1.8} />
-      <directionalLight position={[5, 3, 5]}  intensity={1.2} />
-      <directionalLight position={[-4, 2, -4]} intensity={0.45} color="#b0d0ff" />
-      <directionalLight position={[0, -5, 2]}  intensity={0.25} color="#ffeedd" />
+      <ambientLight intensity={2.5} />
+      <directionalLight position={[5, 3, 5]}  intensity={0.7} />
+      <directionalLight position={[-3, 2, -3]} intensity={0.25} color="#d0e8ff" />
 
-      <Stars radius={280} depth={50} count={2000} factor={3} fade speed={0.2} />
+      <Stars radius={280} depth={50} count={1600} factor={3} fade speed={0.2} />
 
-      <Suspense fallback={<EarthFallback />}>
-        <Earth />
-      </Suspense>
-
+      <Earth />
       <CountryBorders />
 
-      {!loading && sorted.length > 0 && (
+      {sorted.length > 0 && (
         <AirportDots
-          sorted={sorted}
-          tier1End={tier1End}
-          stopIatas={stopIatas}
-          hoveredAirport={hoveredAirport}
-          onClick={addStop}
-          onHover={setHoveredAirport}
+          sorted={sorted} t0end={t0end} t1end={t1end}
+          stopIatas={stopIatas} hovered={hovered}
+          onClick={addStop} onHover={setHovered}
         />
       )}
 
-      {stops.length > 1 && stops.slice(0, -1).map((stop, i) => (
-        <RouteArc key={`${stop.iata}-${stops[i+1].iata}`} from={stop} to={stops[i+1]} />
+      {stops.length > 1 && stops.slice(0, -1).map((s, i) => (
+        <RouteArc key={`${s.iata}-${stops[i+1].iata}`} from={s} to={stops[i+1]} />
       ))}
 
       <OrbitControls
         enablePan={false}
-        minDistance={1.35}
-        maxDistance={4.8}
-        rotateSpeed={0.45}
-        zoomSpeed={0.9}
+        minDistance={1.04}      /* zoom very close to surface */
+        maxDistance={5.2}
+        rotateSpeed={0.38}
+        zoomSpeed={0.7}
         enableDamping
         dampingFactor={0.07}
-        autoRotate={stops.length === 0}   /* rotates when idle, stops when route is building */
+        autoRotate={autoRotate && stops.length === 0}
         autoRotateSpeed={0.5}
       />
     </>
   );
 }
 
-// ─── Main export ──────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Root export
+// ─────────────────────────────────────────────────────────────────────────────
 export default function Globe() {
   const { stops, addStop, setHoveredAirport, hoveredAirport } = useRouteStore();
-  const { loading } = useAirports();
+
+  // Globe auto-rotates until user first touches it — then stops permanently
+  const [autoRotate, setAutoRotate] = useState(true);
+  const touched = useRef(false);
+  const handleTouch = () => {
+    if (!touched.current) { touched.current = true; setAutoRotate(false); }
+  };
 
   return (
-    <div style={{ width: '100%', height: '100%', position: 'relative' }}>
+    <div
+      style={{ width: '100%', height: '100%', position: 'relative' }}
+      onPointerDown={handleTouch}
+    >
       {/* Hover tooltip */}
       {hoveredAirport && (
         <div style={{
           position: 'absolute', bottom: 40, left: '50%',
           transform: 'translateX(-50%)',
-          background: 'rgba(7,11,20,0.92)',
-          border: '1px solid rgba(74,158,255,0.3)',
+          background: 'rgba(255,253,248,0.95)',
+          border: '1px solid rgba(0,0,0,0.08)',
           borderRadius: 8, padding: '7px 16px',
-          color: '#fff', fontSize: 13,
+          color: '#3a3530', fontSize: 13,
           fontFamily: 'inherit', pointerEvents: 'none',
           zIndex: 10, whiteSpace: 'nowrap',
-          backdropFilter: 'blur(10px)',
+          boxShadow: '0 2px 14px rgba(0,0,0,0.14)',
         }}>
-          <span style={{ color: '#ff6b35', fontWeight: 700 }}>{hoveredAirport.iata}</span>
+          <span style={{ color: '#e05a2b', fontWeight: 700 }}>{hoveredAirport.iata}</span>
           {' · '}{hoveredAirport.name}
-          <span style={{ color: '#888', marginLeft: 8 }}>
+          <span style={{ color: '#999', marginLeft: 8 }}>
             {hoveredAirport.city}{hoveredAirport.city && ', '}{hoveredAirport.country}
           </span>
-          {hoveredAirport.tier === 1 && (
-            <span style={{ marginLeft: 8, fontSize: 10, color: '#4dd0e1',
-              background: 'rgba(77,208,225,0.12)', border: '1px solid rgba(77,208,225,0.3)',
+          {TIER0.has(hoveredAirport.iata) && (
+            <span style={{ marginLeft: 8, fontSize: 10, color: '#0d9488',
+              background: 'rgba(13,148,136,0.1)', border: '1px solid rgba(13,148,136,0.3)',
               borderRadius: 4, padding: '1px 6px' }}>HUB</span>
           )}
-        </div>
-      )}
-
-      {/* Loading badge */}
-      {loading && (
-        <div style={{
-          position: 'absolute', top: 16, right: 20,
-          background: 'rgba(7,11,20,0.8)',
-          border: '1px solid rgba(74,158,255,0.25)',
-          borderRadius: 20, padding: '5px 12px',
-          color: 'rgba(255,255,255,0.45)', fontSize: 12,
-          fontFamily: 'inherit', pointerEvents: 'none', zIndex: 10,
-        }}>
-          Loading airports…
         </div>
       )}
 
       {/* Legend */}
       <div style={{
         position: 'absolute', bottom: 40, right: 20,
-        color: 'rgba(255,255,255,0.28)', fontSize: 11,
+        color: 'rgba(255,255,255,0.35)', fontSize: 11,
         fontFamily: 'inherit', pointerEvents: 'none',
         display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4,
       }}>
         <span>Scroll to zoom · Drag to rotate</span>
-        <span style={{ color: 'rgba(77,208,225,0.55)' }}>● Major hubs</span>
-        <span style={{ color: 'rgba(74,158,255,0.45)' }}>· Zoom in for all airports</span>
+        <span style={{ color: 'rgba(45,212,191,0.75)' }}>● Major hubs always visible</span>
+        <span style={{ color: 'rgba(96,165,250,0.6)' }}>· Zoom in to reveal more airports</span>
       </div>
 
       <Canvas
@@ -275,8 +290,9 @@ export default function Globe() {
         <Scene
           stops={stops}
           addStop={addStop}
-          setHoveredAirport={setHoveredAirport}
-          hoveredAirport={hoveredAirport}
+          setHovered={setHoveredAirport}
+          hovered={hoveredAirport}
+          autoRotate={autoRotate}
         />
       </Canvas>
     </div>
