@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { searchAirports } from '../data/airports';
+import { searchAirports } from '../hooks/useAirports';
 import { useRouteStore } from '../store/routeStore';
 import styles from './AirportSearch.module.css';
 
