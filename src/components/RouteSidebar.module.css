@@ -283,6 +283,18 @@
 }
 .searchBtn:hover { opacity: 0.9; transform: translateY(-1px); }
 .searchBtn:active { transform: translateY(0); }
+.searchBtn:disabled { opacity: 0.7; cursor: wait; transform: none; }
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255,255,255,0.35);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  display: inline-block;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 
 .ctaHint {
   text-align: center;
