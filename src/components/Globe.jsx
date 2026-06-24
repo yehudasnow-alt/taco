@@ -9,7 +9,7 @@ mapboxgl.accessToken =
   import.meta.env.VITE_MAPBOX_TOKEN ||
   'pk.eyJ1IjoibWFwYm94IiwiYSI6ImNpejY4NXVycTA2emYycXBndHRqcmZ3N3gifQ.rJcFIG214AriISLbB6B5aw';
 
-// ── Static GeoJSON (the curated list never changes) ───────────────────────────
+// ── Static GeoJSON for airport markers ────────────────────────────────────────
 const AIRPORT_GEOJSON = {
   type: 'FeatureCollection',
   features: AIRPORTS.map(a => ({
@@ -22,19 +22,8 @@ const AIRPORT_GEOJSON = {
   })),
 };
 
-// ── Great-circle helpers ──────────────────────────────────────────────────────
-const R_EARTH_KM = 6371;
-
-function distanceKm(a, b) {
-  const r = Math.PI / 180;
-  const φ1 = a.lat * r, φ2 = b.lat * r;
-  const dφ = (b.lat - a.lat) * r;
-  const dλ = (b.lng - a.lng) * r;
-  const x = Math.sin(dφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(dλ / 2) ** 2;
-  return R_EARTH_KM * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
-}
-
-function gcArc(from, to, n = 96) {
+// ── Great-circle arc (densified for smooth visual curve) ──────────────────────
+function gcArc(from, to, n = 80) {
   const r = Math.PI / 180, D = 180 / Math.PI;
   const la1 = from.lat * r, lo1 = from.lng * r;
   const la2 = to.lat   * r, lo2 = to.lng   * r;
@@ -52,60 +41,53 @@ function gcArc(from, to, n = 96) {
   });
 }
 
-// Build route GeoJSON. Each segment carries its own arc peak height (in meters)
-// so the route can be lifted into 3D space via `line-z-offset`.
-function routeGeoJSON(stops) {
-  if (stops.length < 2) return { type: 'FeatureCollection', features: [] };
-  return {
-    type: 'FeatureCollection',
-    features: stops.slice(0, -1).map((from, i) => {
-      const to = stops[i + 1];
-      const dKm = distanceKm(from, to);
-      // Peak height ≈ distance / 6, clamped. Looks natural across short & long hops.
-      const arcHeight = Math.max(80_000, Math.min(2_000_000, dKm * 1000 / 6));
-      return {
-        type: 'Feature',
-        geometry: { type: 'LineString', coordinates: gcArc(from, to) },
-        properties: { arcHeight },
-      };
-    }),
-  };
-}
-
 // ── Easing ────────────────────────────────────────────────────────────────────
 const easeInOutCubic = t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+
+// ── Clean map: hide everything that isn't water / land / country borders ─────
+function declutter(map) {
+  const layers = map.getStyle()?.layers || [];
+  const hidePatterns = [
+    /road/i, /tunnel/i, /bridge/i, /highway/i, /street/i, /motorway/i,
+    /^path/i, /ferry/i, /rail/i, /aerialway/i,
+    /^poi/i, /transit/i, /^building/i, /^landuse-/i,
+    /admin-1/i, /admin-2/i, /admin-3/i,                     // hide internal admin
+    /state-label/i,
+    /natural-line-label/i, /natural-point-label/i,
+    /water-line-label/i, /water-point-label/i,
+    /settlement-minor-label/i, /settlement-subdivision-label/i,
+  ];
+  layers.forEach(layer => {
+    if (hidePatterns.some(p => p.test(layer.id))) {
+      try { map.setLayoutProperty(layer.id, 'visibility', 'none'); } catch (_) { /* noop */ }
+    }
+  });
+}
 
 // ── Component ─────────────────────────────────────────────────────────────────
 export default function Globe() {
   const containerRef = useRef(null);
+  const svgRef       = useRef(null);
   const mapRef       = useRef(null);
   const rafRef       = useRef(null);
   const idleRef      = useRef(null);
   const stopsRef     = useRef([]);
   const interactingRef = useRef(false);
 
-  // Spin animation state — factor goes 0 (stopped) ↔ 1 (full speed) with easing.
+  // Spin animation state — factor goes 0 (stopped) ↔ 1 (full speed) via cubic easing.
   const spinRef = useRef({
-    factor: 0,           // current speed multiplier
-    from:   0,           // factor at transition start
-    target: 1,           // factor we're heading toward
-    start:  0,           // performance.now() when transition began
-    dur:    1500,        // transition duration in ms
+    factor: 0, from: 0, target: 1, start: 0, dur: 1500,
   });
 
   const { stops, addStop, hoveredAirport, setHoveredAirport } = useRouteStore();
   stopsRef.current = stops;
 
-  // ── Schedule a smooth transition of the spin factor ─────────────────────────
   const transitionSpin = (target, dur) => {
     const s = spinRef.current;
-    s.from   = s.factor;
-    s.target = target;
-    s.start  = performance.now();
-    s.dur    = dur;
+    s.from = s.factor; s.target = target;
+    s.start = performance.now(); s.dur = dur;
   };
 
-  // Advance the easing each frame and return current factor.
   const tickSpin = (now) => {
     const s = spinRef.current;
     if (s.factor === s.target) return s.factor;
@@ -115,13 +97,69 @@ export default function Globe() {
     return s.factor;
   };
 
+  // ── Render arc overlay (DOM-direct for performance during map moves) ────────
+  const renderArcs = () => {
+    const map = mapRef.current;
+    const svg = svgRef.current;
+    if (!map || !svg) return;
+    const stops = stopsRef.current;
+
+    if (stops.length < 2) {
+      svg.innerHTML = '';
+      return;
+    }
+
+    const segments = [];
+    for (let i = 0; i < stops.length - 1; i++) {
+      const from = stops[i];
+      const to   = stops[i + 1];
+      const pts  = gcArc(from, to, 80);
+
+      // Project lat/lng → screen pixels using Mapbox's projection (handles globe + mercator).
+      const proj = pts.map(([lng, lat]) => {
+        const p = map.project([lng, lat]);
+        return [p.x, p.y];
+      });
+
+      // Compute straight-line screen distance between endpoints. The arc peak
+      // height scales with that distance so short hops get small bumps and long
+      // hops get tall arches.
+      const dx = proj[proj.length - 1][0] - proj[0][0];
+      const dy = proj[proj.length - 1][1] - proj[0][1];
+      const screenDist = Math.hypot(dx, dy);
+      const peakLift   = Math.min(Math.max(screenDist * 0.18, 30), 320);
+
+      // Lift each point upward (y is screen-down) by sin(progress)·peakLift.
+      const path = proj.map(([x, y], j) => {
+        const t = j / (proj.length - 1);
+        const lift = Math.sin(t * Math.PI) * peakLift;
+        return (j === 0 ? 'M' : 'L') + x.toFixed(1) + ' ' + (y - lift).toFixed(1);
+      }).join(' ');
+
+      segments.push(path);
+    }
+
+    // Build SVG markup once and inject — much cheaper than reactive re-render.
+    svg.innerHTML = `
+      <defs>
+        <filter id="arcGlow" x="-50%" y="-50%" width="200%" height="200%">
+          <feGaussianBlur stdDeviation="4" />
+        </filter>
+      </defs>
+      ${segments.map(d => `
+        <path d="${d}" fill="none" stroke="#ff6b35" stroke-opacity="0.35" stroke-width="9" filter="url(#arcGlow)" />
+        <path d="${d}" fill="none" stroke="#ff6b35" stroke-width="2.6" stroke-linecap="round" />
+      `).join('')}
+    `;
+  };
+
   // ── Init map (once) ─────────────────────────────────────────────────────────
   useEffect(() => {
     if (mapRef.current) return;
 
     const map = new mapboxgl.Map({
       container: containerRef.current,
-      style:      'mapbox://styles/mapbox/outdoors-v12',
+      style:      'mapbox://styles/mapbox/light-v11',
       projection: 'globe',
       zoom:       1.8,
       center:     [15, 20],
@@ -130,29 +168,22 @@ export default function Globe() {
     });
     mapRef.current = map;
 
-    // Slow the wheel zoom — default feels too aggressive on a globe.
+    // Soften wheel zoom so it doesn't snap.
     map.scrollZoom.setZoomRate(1 / 220);
     map.scrollZoom.setWheelZoomRate(1 / 220);
 
-    // ── Animation loop: rotation with eased speed factor ──────────────────────
+    // ── Animation loop — eased auto-rotation, scaled down at high zoom ──────
     let prev = null;
     const frame = (ts) => {
       const factor = tickSpin(ts);
-
-      // Only spin when:
-      //   • factor > 0
-      //   • user isn't dragging
-      //   • map isn't currently in a programmatic animation
-      //   • no stops yet
       if (prev !== null && factor > 0.001 && !interactingRef.current
           && !map.isMoving() && stopsRef.current.length === 0) {
         const dt   = ts - prev;
         const zoom = map.getZoom();
-        // Rotation fades out as you zoom in (full at zoom ≤ 1.5, none above ~3.5).
         const zoomScale = Math.max(0, Math.min(1, (3.5 - zoom) / 2));
         if (zoomScale > 0) {
           const c = map.getCenter();
-          c.lng += 0.006 * dt * factor * zoomScale; // ~0.36 °/s at full speed
+          c.lng += 0.006 * dt * factor * zoomScale;
           map.setCenter(c, { animate: false });
         }
       }
@@ -162,147 +193,164 @@ export default function Globe() {
     rafRef.current = requestAnimationFrame(frame);
 
     map.on('style.load', () => {
-      // Space + atmosphere fog
+      // Strip noisy layers (roads, POI, internal admin, minor labels).
+      declutter(map);
+
+      // Subtle space + atmosphere
       map.setFog({
-        color:            'rgb(215, 230, 248)',
-        'high-color':     'rgb(28, 65, 200)',
-        'horizon-blend':  0.03,
+        color:            'rgb(220, 232, 248)',
+        'high-color':     'rgb(32, 78, 180)',
+        'horizon-blend':  0.04,
         'space-color':    'rgb(7, 7, 20)',
-        'star-intensity': 0.5,
+        'star-intensity': 0.45,
       });
 
-      // ── Sources ────────────────────────────────────────────────────────────
       map.addSource('airports', { type: 'geojson', data: AIRPORT_GEOJSON });
-      map.addSource('routes',   { type: 'geojson', data: { type:'FeatureCollection', features: [] }, lineMetrics: true });
 
-      // ── Route arc — lifted into 3D space via line-z-offset ────────────────
-      // 5-point sine-ish curve along line-progress, peaking at midpoint at
-      // the per-feature arcHeight (meters). Requires Mapbox GL JS ≥ 3.0.
+      // ── Primary airports: soft outer glow + crisp inner dot ───────────────
       map.addLayer({
-        id: 'route-line',
-        type: 'line',
-        source: 'routes',
-        layout: { 'line-cap': 'round', 'line-join': 'round' },
+        id: 'ap-primary-glow',
+        type: 'circle',
+        source: 'airports',
+        filter: ['==', ['get', 'primary'], true],
         paint: {
-          'line-color':   '#ff6b35',
-          'line-width':   ['interpolate', ['linear'], ['zoom'], 1, 2.2, 6, 3.5],
-          'line-opacity': 0.92,
-          'line-z-offset': [
-            'interpolate', ['linear'], ['line-progress'],
-            0,    0,
-            0.25, ['*', ['get', 'arcHeight'], 0.707],
-            0.5,  ['get', 'arcHeight'],
-            0.75, ['*', ['get', 'arcHeight'], 0.707],
-            1,    0,
-          ],
-          'line-emissive-strength': 1,
+          'circle-radius':  ['interpolate', ['linear'], ['zoom'], 1, 9,  4, 13, 8, 18],
+          'circle-color':   '#0ea5e9',
+          'circle-opacity': 0.28,
+          'circle-blur':    0.65,
         },
       });
-
-      // ── Primary airports — always visible, modest size ────────────────────
       map.addLayer({
         id: 'ap-primary',
         type: 'circle',
         source: 'airports',
         filter: ['==', ['get', 'primary'], true],
         paint: {
-          'circle-radius':       ['interpolate', ['linear'], ['zoom'], 1, 3, 4, 4.5, 8, 6],
+          'circle-radius':       ['interpolate', ['linear'], ['zoom'], 1, 4.5, 4, 6.5, 8, 8.5],
           'circle-color':        '#0ea5e9',
-          'circle-stroke-color': '#ffffff',
-          'circle-stroke-width': 1.3,
-          'circle-opacity':      0.95,
-        },
-      });
-
-      // ── Secondary airports — appear only when zoomed in enough to see the
-      //    country in detail (~zoom 4). Smaller than primaries.
-      map.addLayer({
-        id: 'ap-secondary',
-        type: 'circle',
-        source: 'airports',
-        filter: ['==', ['get', 'primary'], false],
-        paint: {
-          'circle-radius':       ['interpolate', ['linear'], ['zoom'], 4, 2.5, 8, 4.5],
-          'circle-color':        '#7dd3fc',
-          'circle-stroke-color': '#ffffff',
-          'circle-stroke-width': 1,
-          'circle-opacity':      ['interpolate', ['linear'], ['zoom'], 3.6, 0, 4.6, 0.92],
-        },
-      });
-
-      // ── Selected stops — orange, on top, slightly larger ──────────────────
-      map.addLayer({
-        id: 'ap-selected',
-        type: 'circle',
-        source: 'airports',
-        filter: ['in', ['get', 'iata'], ['literal', []]],
-        paint: {
-          'circle-radius':       ['interpolate', ['linear'], ['zoom'], 1, 5, 6, 8],
-          'circle-color':        '#ff6b35',
           'circle-stroke-color': '#ffffff',
           'circle-stroke-width': 2,
           'circle-opacity':      1,
         },
       });
 
-      // ── IATA labels: primaries always, secondaries only when zoomed in ────
+      // ── Secondary airports: appear at zoom ≥ 4 ────────────────────────────
+      map.addLayer({
+        id: 'ap-secondary-glow',
+        type: 'circle',
+        source: 'airports',
+        filter: ['==', ['get', 'primary'], false],
+        paint: {
+          'circle-radius':  ['interpolate', ['linear'], ['zoom'], 4, 7, 8, 12],
+          'circle-color':   '#0ea5e9',
+          'circle-opacity': ['interpolate', ['linear'], ['zoom'], 3.6, 0, 4.6, 0.22],
+          'circle-blur':    0.7,
+        },
+      });
+      map.addLayer({
+        id: 'ap-secondary',
+        type: 'circle',
+        source: 'airports',
+        filter: ['==', ['get', 'primary'], false],
+        paint: {
+          'circle-radius':       ['interpolate', ['linear'], ['zoom'], 4, 3.5, 8, 5.5],
+          'circle-color':        '#38bdf8',
+          'circle-stroke-color': '#ffffff',
+          'circle-stroke-width': 1.6,
+          'circle-opacity':      ['interpolate', ['linear'], ['zoom'], 3.6, 0, 4.6, 1],
+        },
+      });
+
+      // ── Selected stops: orange, prominent, on top ─────────────────────────
+      map.addLayer({
+        id: 'ap-selected-glow',
+        type: 'circle',
+        source: 'airports',
+        filter: ['in', ['get', 'iata'], ['literal', []]],
+        paint: {
+          'circle-radius':  ['interpolate', ['linear'], ['zoom'], 1, 14, 6, 22],
+          'circle-color':   '#ff6b35',
+          'circle-opacity': 0.35,
+          'circle-blur':    0.55,
+        },
+      });
+      map.addLayer({
+        id: 'ap-selected',
+        type: 'circle',
+        source: 'airports',
+        filter: ['in', ['get', 'iata'], ['literal', []]],
+        paint: {
+          'circle-radius':       ['interpolate', ['linear'], ['zoom'], 1, 6.5, 6, 11],
+          'circle-color':        '#ff6b35',
+          'circle-stroke-color': '#ffffff',
+          'circle-stroke-width': 2.5,
+          'circle-opacity':      1,
+        },
+      });
+
+      // ── IATA labels: primary always, secondary only when zoomed in close ──
       map.addLayer({
         id: 'ap-label',
         type: 'symbol',
         source: 'airports',
         filter: ['any',
           ['==', ['get', 'primary'], true],
-          ['all', ['==', ['get', 'primary'], false], ['>=', ['zoom'], 5]],
+          ['all', ['==', ['get', 'primary'], false], ['>=', ['zoom'], 4.5]],
         ],
         layout: {
           'text-field':  ['get', 'iata'],
           'text-font':   ['DIN Pro Medium', 'Arial Unicode MS Regular'],
-          'text-size':   ['interpolate', ['linear'], ['zoom'], 1, 9, 4, 11, 8, 12],
-          'text-offset': [0, 1.1],
+          'text-size':   ['interpolate', ['linear'], ['zoom'], 1, 10, 4, 12, 8, 14],
+          'text-offset': [0, 1.3],
           'text-anchor': 'top',
+          'text-allow-overlap': false,
         },
         paint: {
-          'text-color':      '#1e3a5f',
-          'text-halo-color': 'rgba(255,255,255,0.85)',
-          'text-halo-width': 1.4,
-          'text-opacity':    ['interpolate', ['linear'], ['zoom'], 1, 0.6, 3, 0.95, 5, 1],
+          'text-color':      '#0c4a6e',
+          'text-halo-color': 'rgba(255,255,255,0.95)',
+          'text-halo-width': 2,
+          'text-opacity':    ['interpolate', ['linear'], ['zoom'], 1, 0.7, 3, 0.95, 5, 1],
         },
       });
 
-      // Start spinning gently if no stops yet.
+      // Initial spin if no stops
       if (stopsRef.current.length === 0) transitionSpin(1, 1800);
+
+      // Initial arc render (in case stops were already set somehow)
+      renderArcs();
     });
 
-    // ── Interaction: pause spin smoothly while user is touching the globe ────
+    // Arcs redraw on every map movement (auto-spin, dragging, zooming, resizing).
+    map.on('move',   renderArcs);
+    map.on('resize', renderArcs);
+
+    // ── Interaction → smooth pause / resume ────────────────────────────────
     const onInteractStart = () => {
       interactingRef.current = true;
       clearTimeout(idleRef.current);
-      // Ease the spin down (not abrupt) — 450ms looks like the globe gently stops.
       if (spinRef.current.target !== 0) transitionSpin(0, 450);
     };
-
     const onInteractEnd = () => {
       interactingRef.current = false;
-      if (stopsRef.current.length > 0) return;            // route in progress → stay paused
+      if (stopsRef.current.length > 0) return;
       clearTimeout(idleRef.current);
       idleRef.current = setTimeout(() => {
         if (interactingRef.current || stopsRef.current.length > 0) return;
-        transitionSpin(1, 1800);                          // ease back up over 1.8s
-      }, 2500);                                            // …after 2.5s of stillness
+        transitionSpin(1, 1800);
+      }, 2500);
     };
 
-    map.on('dragstart',     onInteractStart);
-    map.on('rotatestart',   onInteractStart);
-    map.on('pitchstart',    onInteractStart);
-    map.on('zoomstart',     onInteractStart);
-    map.on('touchstart',    onInteractStart);
-    map.on('dragend',       onInteractEnd);
-    map.on('rotateend',     onInteractEnd);
-    map.on('pitchend',      onInteractEnd);
-    map.on('zoomend',       onInteractEnd);
-    map.on('touchend',      onInteractEnd);
+    map.on('dragstart',   onInteractStart);
+    map.on('rotatestart', onInteractStart);
+    map.on('pitchstart',  onInteractStart);
+    map.on('zoomstart',   onInteractStart);
+    map.on('touchstart',  onInteractStart);
+    map.on('dragend',     onInteractEnd);
+    map.on('rotateend',   onInteractEnd);
+    map.on('pitchend',    onInteractEnd);
+    map.on('zoomend',     onInteractEnd);
+    map.on('touchend',    onInteractEnd);
 
-    // Wheel zoom doesn't fire dragstart/dragend — debounce it ourselves.
     let wheelEnd = null;
     map.on('wheel', () => {
       onInteractStart();
@@ -310,7 +358,7 @@ export default function Globe() {
       wheelEnd = setTimeout(onInteractEnd, 220);
     });
 
-    // ── Click / hover on airport dots ─────────────────────────────────────────
+    // ── Click + hover on airport dots ────────────────────────────────────────
     ['ap-primary', 'ap-secondary'].forEach(layer => {
       map.on('click', layer, e => {
         const p = e.features[0].properties;
@@ -341,17 +389,20 @@ export default function Globe() {
     };
   }, []); // eslint-disable-line
 
-  // ── Sync route arcs + selected highlight when stops change ──────────────────
+  // ── Sync selected highlight + redraw arcs when stops change ────────────────
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-    const sync = () => {
-      map.getSource('routes')?.setData(routeGeoJSON(stops));
-      map.setFilter?.('ap-selected', ['in', ['get', 'iata'], ['literal', stops.map(s => s.iata)]]);
+    const apply = () => {
+      const iatas = stops.map(s => s.iata);
+      ['ap-selected', 'ap-selected-glow'].forEach(id => {
+        map.setFilter?.(id, ['in', ['get', 'iata'], ['literal', iatas]]);
+      });
+      renderArcs();
     };
-    map.isStyleLoaded() ? sync() : map.once('style.load', sync);
+    map.isStyleLoaded() ? apply() : map.once('style.load', apply);
 
-    // Adding a stop pauses the spin smoothly; clearing the route lets it resume.
+    // Spin management: pause when there's a route, resume idle when there isn't.
     clearTimeout(idleRef.current);
     if (stops.length > 0) {
       transitionSpin(0, 450);
@@ -363,6 +414,17 @@ export default function Globe() {
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
       <div ref={containerRef} style={{ width: '100%', height: '100%' }} />
+
+      {/* SVG overlay for the real curved arcs (sits above the map) */}
+      <svg
+        ref={svgRef}
+        style={{
+          position: 'absolute', inset: 0,
+          width: '100%', height: '100%',
+          pointerEvents: 'none',
+          zIndex: 2,
+        }}
+      />
 
       {/* Hover tooltip */}
       {hoveredAirport && (
@@ -396,13 +458,14 @@ export default function Globe() {
       {/* Legend */}
       <div style={{
         position: 'absolute', bottom: 40, right: 20,
-        color: 'rgba(30,30,30,0.45)', fontSize: 11,
+        color: 'rgba(30,30,30,0.55)', fontSize: 11,
         fontFamily: 'inherit', pointerEvents: 'none',
         display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4,
+        zIndex: 3,
       }}>
         <span>Scroll to zoom · Drag to rotate</span>
-        <span style={{ color: 'rgba(14,165,233,0.8)' }}>● Main hubs</span>
-        <span style={{ color: 'rgba(125,211,252,0.85)' }}>● Zoom in for more</span>
+        <span style={{ color: 'rgba(14,165,233,0.95)' }}>● Main hubs</span>
+        <span style={{ color: 'rgba(56,189,248,0.95)' }}>● Zoom in for more</span>
       </div>
     </div>
   );
