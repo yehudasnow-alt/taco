@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react';
 import { AIRPORTS as STATIC } from '../data/airports';
 
 const CSV_URL  = 'https://raw.githubusercontent.com/davidmegginson/ourairports-data/main/airports.csv';
-const CACHE_KEY = 'taco_airports_v3';
+const CACHE_KEY = 'taco_airports_v4';
 const CACHE_TTL = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 // ── Tier assignment ────────────────────────────────────────────────────────
@@ -112,32 +112,80 @@ const ISO_NAMES = {
   LA: 'Laos', MN: 'Mongolia', BN: 'Brunei', FJ: 'Fiji',
 };
 
-// Merge static curated airports with CSV. Curated wins on duplicate IATA,
-// keeping their `primary` flag (which determines tier 0).
+// Merge static curated airports with CSV, assigning tiers per country so
+// EVERY country with commercial service gets exactly one tier-0 representative
+// visible from a zoomed-out view. Logic:
+//   • curated tier 0 (primary: true) → kept as-is. That country is "covered".
+//   • curated tier 1 (primary: false) → kept as-is.
+//   • for any country WITHOUT a curated tier 0: auto-elect its largest CSV
+//     airport (large > medium > small) as tier 0.
+//   • all remaining CSV airports → tier 1 / 2 / 3 by size.
 function mergeAndTier(csvAirports) {
-  const byIata = new Map();
+  // iata → ISO country (so we can tell which country a curated airport belongs to)
+  const iataToIso = new Map();
+  for (const c of csvAirports) iataToIso.set(c.iata, c.country);
 
-  // 1. Curated airports first — they keep their tier 0/1 from `primary`.
+  // Set of ISO countries that already have a curated tier-0 hub.
+  const curatedT0Iso = new Set();
   for (const a of STATIC_TIERED) {
-    byIata.set(a.iata, a);
+    if (a.tier === 0) {
+      const iso = iataToIso.get(a.iata);
+      if (iso) curatedT0Iso.add(iso);
+    }
   }
 
-  // 2. CSV airports — only added if not already in curated. Tier from size.
+  // Group CSV airports by ISO country, sorted largest-first.
+  const sizeRank = { large_airport: 0, medium_airport: 1, small_airport: 2 };
+  const byCountry = new Map();
   for (const c of csvAirports) {
-    if (byIata.has(c.iata)) continue; // curated wins
-    const tier =
-      c._csvType === 'large_airport'  ? 1 :
-      c._csvType === 'medium_airport' ? 2 : 3;
-    byIata.set(c.iata, {
-      iata:    c.iata,
-      name:    c.name,
-      city:    c.city,
-      country: ISO_NAMES[c.country] || c.country,
-      lat:     c.lat,
-      lng:     c.lng,
-      tier,
-      primary: false,
-    });
+    if (!byCountry.has(c.country)) byCountry.set(c.country, []);
+    byCountry.get(c.country).push(c);
+  }
+  for (const list of byCountry.values()) {
+    list.sort((a, b) => sizeRank[a._csvType] - sizeRank[b._csvType]);
+  }
+
+  // Build the merged list. Curated wins on IATA collisions.
+  const byIata = new Map();
+  for (const a of STATIC_TIERED) byIata.set(a.iata, a);
+
+  for (const [iso, list] of byCountry) {
+    let needsAutoT0 = !curatedT0Iso.has(iso);
+
+    for (const c of list) {
+      if (byIata.has(c.iata)) continue;
+
+      let tier;
+      if (needsAutoT0 && c._csvType !== 'small_airport') {
+        // Promote the largest non-small airport in this country to tier 0.
+        tier = 0;
+        needsAutoT0 = false;
+      } else {
+        tier =
+          c._csvType === 'large_airport'  ? 1 :
+          c._csvType === 'medium_airport' ? 2 : 3;
+      }
+
+      byIata.set(c.iata, {
+        iata:    c.iata,
+        name:    c.name,
+        city:    c.city,
+        country: ISO_NAMES[iso] || iso,
+        lat:     c.lat,
+        lng:     c.lng,
+        tier,
+        primary: tier === 0,
+      });
+    }
+
+    // Country has only small airports → still elect one as tier 0 so it isn't invisible from far.
+    if (needsAutoT0 && list.length > 0) {
+      const first = list.find(c => !byIata.has(c.iata) || byIata.get(c.iata).tier !== 0);
+      const target = first ? byIata.get(first.iata) : null;
+      if (target && target.tier !== 0) {
+        byIata.set(target.iata, { ...target, tier: 0, primary: true });
+      }
+    }
   }
 
   return Array.from(byIata.values());
