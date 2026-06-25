@@ -9,29 +9,10 @@ mapboxgl.accessToken =
   import.meta.env.VITE_MAPBOX_TOKEN ||
   'pk.eyJ1IjoibWFwYm94IiwiYSI6ImNpejY4NXVycTA2emYycXBndHRqcmZ3N3gifQ.rJcFIG214AriISLbB6B5aw';
 
-// ── Great-circle arc ──────────────────────────────────────────────────────────
-function gcArc(from, to, n = 96) {
-  const r = Math.PI / 180, D = 180 / Math.PI;
-  const la1 = from.lat * r, lo1 = from.lng * r;
-  const la2 = to.lat   * r, lo2 = to.lng   * r;
-  const d = 2 * Math.asin(Math.sqrt(
-    Math.sin((la2 - la1) / 2) ** 2 + Math.cos(la1) * Math.cos(la2) * Math.sin((lo2 - lo1) / 2) ** 2
-  ));
-  if (d < 1e-10) return [[from.lng, from.lat]];
-  return Array.from({ length: n + 1 }, (_, i) => {
-    const f = i / n;
-    const A = Math.sin((1 - f) * d) / Math.sin(d), B = Math.sin(f * d) / Math.sin(d);
-    const x = A * Math.cos(la1) * Math.cos(lo1) + B * Math.cos(la2) * Math.cos(lo2);
-    const y = A * Math.cos(la1) * Math.sin(lo1) + B * Math.cos(la2) * Math.sin(lo2);
-    const z = A * Math.sin(la1) + B * Math.sin(la2);
-    return [Math.atan2(y, x) * D, Math.atan2(z, Math.sqrt(x * x + y * y)) * D];
-  });
-}
-
 const easeInOutCubic = t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 
-// True if the given lng/lat is on the camera-facing side of the globe.
-// Uses 3D unit-sphere dot product against the map center direction.
+// 3D unit-sphere dot product against map-center direction. True if the
+// lng/lat is on the camera-facing hemisphere (with a small horizon buffer).
 function visibleFromCenter(lng, lat, cLng, cLat) {
   const r = Math.PI / 180;
   const pLa = lat * r, pLo = lng * r;
@@ -39,7 +20,47 @@ function visibleFromCenter(lng, lat, cLng, cLat) {
   const dot =
     Math.cos(pLa) * Math.cos(cLa) * Math.cos(pLo - cLo) +
     Math.sin(pLa) * Math.sin(cLa);
-  return dot > 0.05; // small buffer so we don't draw points right at the horizon
+  return dot > 0.08;
+}
+
+// Build a single SVG path command (M…Q…) for one chord, OR null if either
+// endpoint is hidden behind the globe. Uses a quadratic Bézier curve so the
+// shape stays anchored to the two projected endpoints — when the globe is
+// rotated, the curve translates with them instead of waving around.
+//
+// Lift direction = outward from the globe's screen centre (so the apex of
+// every arc always rises away from the planet rather than "up" in absolute
+// screen coords). Magnitude scales with chord length, clamped so close
+// pairs still get a visible arch and very long pairs don't blow up.
+function bezierChord(map, from, to, cLng, cLat, csScreen) {
+  if (!visibleFromCenter(from.lng, from.lat, cLng, cLat)) return null;
+  if (!visibleFromCenter(to.lng,   to.lat,   cLng, cLat)) return null;
+
+  const p1 = map.project([from.lng, from.lat]);
+  const p2 = map.project([to.lng,   to.lat]);
+
+  const mx = (p1.x + p2.x) / 2;
+  const my = (p1.y + p2.y) / 2;
+
+  const chord = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+  const lift  = Math.min(Math.max(chord * 0.32, 50), 380);
+
+  // Direction outward from globe centre on screen; if midpoint sits exactly
+  // on the centre, just go straight up.
+  const rx = mx - csScreen.x;
+  const ry = my - csScreen.y;
+  const rlen = Math.hypot(rx, ry);
+  const ux = rlen > 1 ? rx / rlen : 0;
+  const uy = rlen > 1 ? ry / rlen : -1;
+
+  // For a quadratic Bézier, the curve's midpoint at t=0.5 is
+  //   0.25·P0 + 0.5·P1 + 0.25·P2
+  // To make that midpoint land at (chord-mid) + lift·dir, place the control
+  // point at chord-mid + 2·lift·dir.
+  const ctrlX = mx + 2 * lift * ux;
+  const ctrlY = my + 2 * lift * uy;
+
+  return `M ${p1.x.toFixed(1)} ${p1.y.toFixed(1)} Q ${ctrlX.toFixed(1)} ${ctrlY.toFixed(1)} ${p2.x.toFixed(1)} ${p2.y.toFixed(1)}`;
 }
 
 function declutter(map) {
@@ -71,21 +92,19 @@ export default function Globe() {
 
   const spinRef = useRef({ factor: 0, from: 0, target: 1, start: 0, dur: 1500 });
 
-  const { airports } = useAirports();
+  const { airports, loading } = useAirports();
   const store = useRouteStore();
   const {
     origin, destination, intermediates,
     maxStops, tripType,
     routeOptions, selectedRouteId,
     hoveredAirport, setHoveredAirport,
-    pickAirport, setRouteOptions, selectRoute,
+    setRouteOptions, selectRoute,
   } = store;
 
-  // Refs that animation/render handlers read — avoid stale closures.
   const stateRef = useRef(store);
   stateRef.current = store;
 
-  // GeoJSON regenerates whenever the airports dataset updates.
   const airportGeoJSON = useMemo(() => ({
     type: 'FeatureCollection',
     features: airports.map(a => ({
@@ -93,7 +112,8 @@ export default function Globe() {
       geometry: { type: 'Point', coordinates: [a.lng, a.lat] },
       properties: {
         iata: a.iata, name: a.name, city: a.city, country: a.country,
-        lat: a.lat, lng: a.lng, tier: a.tier, primary: a.tier === 0,
+        lat: a.lat, lng: a.lng,
+        tier: typeof a.tier === 'number' ? a.tier : (a.primary ? 0 : 1),
       },
     })),
   }), [airports]);
@@ -112,15 +132,8 @@ export default function Globe() {
     return s.factor;
   };
 
-  // ── Render route arcs as SVG overlay ────────────────────────────────────────
-  // For each route, we walk its great-circle path one point at a time:
-  //   (1) skip points hidden behind the globe (hemisphere check)
-  //   (2) project visible points to screen space
-  //   (3) lift each point outward radially from the globe's screen center
-  //       blended with a touch of straight-up so arcs near the centre still
-  //       rise visibly. Magnitude follows sin(progress·π).
-  // Visible runs become SVG sub-paths so the arc disappears cleanly when it
-  // wraps behind the globe and re-emerges later.
+  // Walk every route's stop pairs and emit Bézier path segments.
+  // Each segment is independent — if one chord is occluded, the others still draw.
   const renderArcs = () => {
     const map = mapRef.current;
     const svg = svgRef.current;
@@ -128,30 +141,24 @@ export default function Globe() {
 
     const { routeOptions, selectedRouteId, origin, destination, intermediates, tripType } = stateRef.current;
 
-    // Choose what to draw: algorithmic route options, or the manual route, or nothing.
     let routesToDraw = routeOptions;
     if (routesToDraw.length === 0) {
       const manual = buildManualRoute({ origin, destination, intermediates, tripType });
       if (manual) routesToDraw = [{ ...manual, id: 'manual' }];
     }
-
     if (routesToDraw.length === 0) { svg.innerHTML = ''; return; }
 
     const center = map.getCenter();
-    const centerScreen = map.project([center.lng, center.lat]);
-    const cx = centerScreen.x, cy = centerScreen.y;
+    const cs     = map.project([center.lng, center.lat]);
 
-    // Sort so the selected route is drawn last (on top).
+    // Draw selected route last so it sits on top
     const sorted = [...routesToDraw].sort((a, b) => {
       const aSel = a.id === selectedRouteId ? 1 : 0;
       const bSel = b.id === selectedRouteId ? 1 : 0;
       return aSel - bSel;
     });
 
-    const RADIAL_WEIGHT   = 0.65; // 65% radial + 35% straight-up = arcs lift naturally
-    const VERTICAL_WEIGHT = 1 - RADIAL_WEIGHT;
-
-    let svgContent = `
+    let content = `
       <defs>
         <filter id="arcGlow" x="-50%" y="-50%" width="200%" height="200%">
           <feGaussianBlur stdDeviation="4" />
@@ -160,78 +167,31 @@ export default function Globe() {
     `;
 
     for (const route of sorted) {
-      const isSelected = route.id === selectedRouteId;
-      const opacity    = isSelected ? 1 : 0.45;
-      const widthMain  = isSelected ? 3.2 : 2.2;
-      const widthGlow  = isSelected ? 10  : 6;
+      const isSel = route.id === selectedRouteId;
+      const op    = isSel ? 1 : 0.45;
+      const wMain = isSel ? 3.2 : 2.2;
+      const wGlow = isSel ? 11  : 6.5;
 
-      const segmentPaths = [];
-
-      for (let segI = 0; segI < route.stops.length - 1; segI++) {
-        const from = route.stops[segI];
-        const to   = route.stops[segI + 1];
-
-        const fromScreen = map.project([from.lng, from.lat]);
-        const toScreen   = map.project([to.lng,   to.lat]);
-        const screenDist = Math.hypot(toScreen.x - fromScreen.x, toScreen.y - fromScreen.y);
-        const peakLift   = Math.min(Math.max(screenDist * 0.20, 35), 340);
-
-        const pts = gcArc(from, to, 96);
-
-        let pathStr = '';
-        let inSeg = false;
-        for (let j = 0; j < pts.length; j++) {
-          const [lng, lat] = pts[j];
-          if (!visibleFromCenter(lng, lat, center.lng, center.lat)) {
-            inSeg = false;
-            continue;
-          }
-          const screen = map.project([lng, lat]);
-          const t = j / (pts.length - 1);
-          const lift = Math.sin(t * Math.PI) * peakLift;
-
-          // Direction: outward from globe centre in screen space.
-          const rdx = screen.x - cx, rdy = screen.y - cy;
-          const rlen = Math.hypot(rdx, rdy);
-          const ux_r = rlen > 1 ? rdx / rlen : 0;
-          const uy_r = rlen > 1 ? rdy / rlen : -1;
-
-          // Blend with straight-up so arcs over the centre of view still rise.
-          const bx = ux_r * RADIAL_WEIGHT + 0  * VERTICAL_WEIGHT;
-          const by = uy_r * RADIAL_WEIGHT + -1 * VERTICAL_WEIGHT;
-          const blen = Math.hypot(bx, by);
-          const ux = blen > 0 ? bx / blen : 0;
-          const uy = blen > 0 ? by / blen : -1;
-
-          const x = screen.x + ux * lift;
-          const y = screen.y + uy * lift;
-
-          pathStr += (inSeg ? 'L' : 'M') + ' ' + x.toFixed(1) + ' ' + y.toFixed(1) + ' ';
-          inSeg = true;
-        }
-        if (pathStr) segmentPaths.push(pathStr);
+      for (let i = 0; i < route.stops.length - 1; i++) {
+        const d = bezierChord(map, route.stops[i], route.stops[i + 1], center.lng, center.lat, cs);
+        if (!d) continue;
+        content += `<path d="${d}" fill="none" stroke="${route.color}" stroke-opacity="${0.35 * op}" stroke-width="${wGlow}" filter="url(#arcGlow)" />`;
+        content += `<path d="${d}" fill="none" stroke="${route.color}" stroke-opacity="${op}"          stroke-width="${wMain}" stroke-linecap="round" />`;
       }
-
-      segmentPaths.forEach(d => {
-        svgContent += `<path d="${d}" fill="none" stroke="${route.color}" stroke-opacity="${0.35 * opacity}" stroke-width="${widthGlow}" filter="url(#arcGlow)" />`;
-        svgContent += `<path d="${d}" fill="none" stroke="${route.color}" stroke-opacity="${opacity}" stroke-width="${widthMain}" stroke-linecap="round" />`;
-      });
     }
 
-    svg.innerHTML = svgContent;
+    svg.innerHTML = content;
   };
 
-  // ── Init map (once) ─────────────────────────────────────────────────────────
+  // ── Init map once ──────────────────────────────────────────────────────────
   useEffect(() => {
     if (mapRef.current) return;
 
     const map = new mapboxgl.Map({
       container: containerRef.current,
-      style:      'mapbox://styles/mapbox/outdoors-v12',
-      projection: 'globe',
-      zoom:       1.8,
-      center:     [15, 20],
-      pitch:      0,
+      style:     'mapbox://styles/mapbox/outdoors-v12',
+      projection:'globe',
+      zoom: 1.8, center: [15, 20], pitch: 0,
       fadeDuration: 0,
     });
     mapRef.current = map;
@@ -242,15 +202,15 @@ export default function Globe() {
     let prev = null;
     const frame = (ts) => {
       const factor = tickSpin(ts);
-      const noStops = !stateRef.current.origin && !stateRef.current.destination;
+      const noEndpoints = !stateRef.current.origin && !stateRef.current.destination;
       if (prev !== null && factor > 0.001 && !interactingRef.current
-          && !map.isMoving() && noStops) {
+          && !map.isMoving() && noEndpoints) {
         const dt   = ts - prev;
         const zoom = map.getZoom();
-        const zoomScale = Math.max(0, Math.min(1, (3.5 - zoom) / 2));
-        if (zoomScale > 0) {
+        const zScale = Math.max(0, Math.min(1, (3.5 - zoom) / 2));
+        if (zScale > 0) {
           const c = map.getCenter();
-          c.lng += 0.006 * dt * factor * zoomScale;
+          c.lng += 0.006 * dt * factor * zScale;
           map.setCenter(c, { animate: false });
         }
       }
@@ -272,7 +232,7 @@ export default function Globe() {
 
       map.addSource('airports', { type: 'geojson', data: airportGeoJSON });
 
-      // ── Tier 0 (country primary): bold blue, glow, always visible ─────────
+      // ── Tier 0: country-primary hub — ALWAYS visible, bold blue, glow ─────
       map.addLayer({
         id: 'ap-t0-glow', type: 'circle', source: 'airports',
         filter: ['==', ['get', 'tier'], 0],
@@ -291,12 +251,11 @@ export default function Globe() {
           'circle-color':        '#0ea5e9',
           'circle-stroke-color': '#ffffff',
           'circle-stroke-width': 2,
-          'circle-opacity':      1,
         },
       });
 
-      // ── Secondary tiers (1–3): white fill, blue outline, smaller. Hidden
-      //    until you zoom into a country (≥ 4.5 for major, ≥ 5.5 / 7 for the rest).
+      // ── Tiers 1-3: white fill + blue outline. Only visible once the user
+      //    zooms into a country (≥ 4.5 / 5.5 / 7). Lighter strokes per tier.
       map.addLayer({
         id: 'ap-t1', type: 'circle', source: 'airports',
         filter: ['==', ['get', 'tier'], 1],
@@ -306,6 +265,7 @@ export default function Globe() {
           'circle-stroke-color': '#0ea5e9',
           'circle-stroke-width': 1.8,
           'circle-opacity':      ['interpolate', ['linear'], ['zoom'], 4.3, 0, 5.0, 1],
+          'circle-stroke-opacity': ['interpolate', ['linear'], ['zoom'], 4.3, 0, 5.0, 1],
         },
       });
       map.addLayer({
@@ -317,6 +277,7 @@ export default function Globe() {
           'circle-stroke-color': '#38bdf8',
           'circle-stroke-width': 1.4,
           'circle-opacity':      ['interpolate', ['linear'], ['zoom'], 5.3, 0, 6.0, 1],
+          'circle-stroke-opacity': ['interpolate', ['linear'], ['zoom'], 5.3, 0, 6.0, 1],
         },
       });
       map.addLayer({
@@ -328,10 +289,11 @@ export default function Globe() {
           'circle-stroke-color': '#7dd3fc',
           'circle-stroke-width': 1.2,
           'circle-opacity':      ['interpolate', ['linear'], ['zoom'], 6.8, 0, 7.5, 1],
+          'circle-stroke-opacity': ['interpolate', ['linear'], ['zoom'], 6.8, 0, 7.5, 1],
         },
       });
 
-      // ── Selected stops (orange, prominent, on top) ─────────────────────────
+      // Selected stops glow (orange) — on top, glued to the chosen route
       map.addLayer({
         id: 'ap-sel-glow', type: 'circle', source: 'airports',
         filter: ['in', ['get', 'iata'], ['literal', []]],
@@ -353,7 +315,7 @@ export default function Globe() {
         },
       });
 
-      // ── IATA labels: tier-aware visibility ────────────────────────────────
+      // IATA labels — tier-aware, halo for readability
       map.addLayer({
         id: 'ap-label', type: 'symbol', source: 'airports',
         filter: ['any',
@@ -422,7 +384,6 @@ export default function Globe() {
       wheelEnd = setTimeout(onInteractEnd, 220);
     });
 
-    // Bind click + hover to every tier layer.
     ['ap-t0', 'ap-t1', 'ap-t2', 'ap-t3'].forEach(layer => {
       map.on('click', layer, e => {
         const p = e.features[0].properties;
@@ -430,15 +391,15 @@ export default function Globe() {
           iata: p.iata, name: p.name, city: p.city, country: p.country,
           lat: Number(p.lat), lng: Number(p.lng),
         };
-        // Use a fresh getState call to avoid stale closure
         stateRef.current.pickAirport(airport);
       });
       map.on('mouseenter', layer, e => {
         map.getCanvas().style.cursor = 'pointer';
         const p = e.features[0].properties;
+        const tier = Number(p.tier);
         stateRef.current.setHoveredAirport({
           iata: p.iata, name: p.name, city: p.city, country: p.country,
-          primary: p.primary === true || p.primary === 'true',
+          primary: tier === 0,
         });
       });
       map.on('mouseleave', layer, () => {
@@ -455,7 +416,7 @@ export default function Globe() {
     };
   }, []); // eslint-disable-line
 
-  // ── Refresh source when airports dataset grows ──────────────────────────────
+  // Push fresh airport data to the source whenever it changes
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -463,7 +424,7 @@ export default function Globe() {
     map.isStyleLoaded() ? apply() : map.once('style.load', apply);
   }, [airportGeoJSON]);
 
-  // ── Generate route options whenever the search params change ────────────────
+  // Algorithmic route generation
   useEffect(() => {
     if (!origin || !destination) {
       setRouteOptions([]);
@@ -471,8 +432,7 @@ export default function Globe() {
       return;
     }
     if (intermediates.length > 0) {
-      // Manual override — the user has explicit stops; skip the algorithm
-      // and render exactly the manual route (built inside renderArcs).
+      // User has forced manual stops — yield to them, skip the algorithm.
       setRouteOptions([]);
       selectRoute(null);
       return;
@@ -484,9 +444,9 @@ export default function Globe() {
     });
     setRouteOptions(opts);
     selectRoute(opts[0]?.id || null);
-  }, [origin, destination, intermediates, maxStops, tripType, airports]);  // eslint-disable-line
+  }, [origin, destination, intermediates, maxStops, tripType, airports]); // eslint-disable-line
 
-  // ── Update selected highlight + redraw arcs when routes change ──────────────
+  // Update selected highlight + redraw arcs when routes/selection change
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -506,7 +466,7 @@ export default function Globe() {
     } else if (!interactingRef.current) {
       idleRef.current = setTimeout(() => transitionSpin(1, 1800), 800);
     }
-  }, [origin, destination, intermediates, routeOptions, selectedRouteId]);  // eslint-disable-line
+  }, [origin, destination, intermediates, routeOptions, selectedRouteId]); // eslint-disable-line
 
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
@@ -521,6 +481,33 @@ export default function Globe() {
           zIndex: 2,
         }}
       />
+
+      {loading && (
+        <div style={{
+          position: 'absolute', top: 16, left: '50%',
+          transform: 'translateX(-50%)',
+          background: 'rgba(11,20,36,0.85)',
+          border: '1px solid rgba(255,255,255,0.1)',
+          borderRadius: 999,
+          padding: '6px 14px',
+          color: 'rgba(255,255,255,0.85)',
+          fontSize: 12,
+          fontFamily: 'inherit',
+          zIndex: 4,
+          display: 'flex', alignItems: 'center', gap: 8,
+          pointerEvents: 'none',
+        }}>
+          <div style={{
+            width: 12, height: 12,
+            border: '2px solid rgba(255,255,255,0.25)',
+            borderTopColor: '#38bdf8',
+            borderRadius: '50%',
+            animation: 'taco-spin 0.8s linear infinite',
+          }} />
+          Loading airports…
+        </div>
+      )}
+      <style>{`@keyframes taco-spin { to { transform: rotate(360deg); } }`}</style>
 
       {hoveredAirport && (
         <div style={{
