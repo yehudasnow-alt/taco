@@ -5,7 +5,7 @@
 export const AIRPORTS = [
   // ── Middle East ─────────────────────────────────────────────────────────────
   { iata: "TLV", name: "Ben Gurion",            city: "Tel Aviv",    country: "Israel",       lat: 32.0114, lng:  34.8867, primary: true  },
-  { iata: "ETM", name: "Ramon Airport",         city: "Eilat",       country: "Israel",       lat: 29.7236, lng:  35.0114, primary: false },
+  { iata: "RMN", name: "Ramon Airport",         city: "Eilat",       country: "Israel",       lat: 29.7236, lng:  35.0114, primary: false },
   { iata: "HFA", name: "Haifa Airport",         city: "Haifa",       country: "Israel",       lat: 32.8094, lng:  35.0431, primary: false },
   { iata: "AMM", name: "Queen Alia Intl",       city: "Amman",       country: "Jordan",       lat: 31.7226, lng:  35.9933, primary: true  },
   { iata: "BEY", name: "Rafic Hariri Intl",     city: "Beirut",      country: "Lebanon",      lat: 33.8209, lng:  35.4884, primary: true  },
@@ -134,8 +134,19 @@ export const AIRPORTS = [
   { iata: "UIO", name: "Mariscal Sucre",        city: "Quito",       country: "Ecuador",      lat:  -0.1292,lng: -78.3575, primary: true  },
 ];
 
-// NOTE: `searchAirports` lives in src/hooks/useAirports.js so it can query the
-// merged dataset (curated + OurAirports CSV) instead of only the curated 115.
+export function searchAirports(query) {
+  if (!query || query.length < 2) return [];
+  const q = query.toLowerCase();
+  return AIRPORTS.filter(a =>
+    a.iata.toLowerCase().includes(q) ||
+    a.name.toLowerCase().includes(q) ||
+    a.city.toLowerCase().includes(q) ||
+    a.country.toLowerCase().includes(q)
+  )
+  // Show primaries first, then alphabetically
+  .sort((a, b) => (b.primary === a.primary) ? a.iata.localeCompare(b.iata) : (b.primary ? 1 : -1))
+  .slice(0, 8);
+}
 
 export function getAirportByIata(iata) {
   return AIRPORTS.find(a => a.iata === iata.toUpperCase());

@@ -1,0 +1,454 @@
+/* ── Panel shell ─────────────────────────────────────────────────────────── */
+.panel {
+  width: 360px;
+  min-width: 360px;
+  height: 100vh;
+  background: linear-gradient(180deg, #0b1424 0%, #0a1320 100%);
+  border-right: 1px solid rgba(255,255,255,0.06);
+  display: flex;
+  flex-direction: column;
+  color: #e8eaf0;
+  font-size: 13px;
+}
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 20px 14px;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+}
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+}
+.logoText {
+  font-size: 17px;
+  letter-spacing: 0.3px;
+}
+.clearBtn {
+  background: none;
+  border: none;
+  color: rgba(255,255,255,0.55);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+.clearBtn:hover { color: #fff; }
+
+.scrollArea {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 18px;
+}
+
+/* ── Endpoints (From / To with swap) ─────────────────────────────────────── */
+.endpoints {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.swapBtn {
+  position: absolute;
+  right: -2px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: #0e1929;
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 999px;
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(255,255,255,0.7);
+  cursor: pointer;
+  z-index: 2;
+}
+.swapBtn:hover:not(:disabled) {
+  color: #fff;
+  border-color: rgba(255,255,255,0.2);
+}
+.swapBtn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+/* ── Airport picker ──────────────────────────────────────────────────────── */
+.pickerWrap {
+  position: relative;
+}
+.pickerLabel {
+  display: block;
+  font-size: 10px;
+  color: rgba(255,255,255,0.5);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  margin-bottom: 6px;
+}
+.pickerField {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px;
+  padding: 10px 12px;
+  cursor: text;
+  transition: border-color 0.15s, background 0.15s;
+}
+.pickerField:hover {
+  background: rgba(255,255,255,0.06);
+}
+.pickerFieldActive {
+  border-color: #0ea5e9;
+  background: rgba(14,165,233,0.08);
+}
+.pickerIcon { font-size: 15px; opacity: 0.8; }
+.pickerInput {
+  flex: 1;
+  background: none;
+  border: none;
+  color: #fff;
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+}
+.pickerInput::placeholder { color: rgba(255,255,255,0.4); }
+.pickerValue {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+}
+.pickerIata {
+  color: #0ea5e9;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+}
+.pickerCity {
+  color: rgba(255,255,255,0.7);
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pickerClear {
+  margin-left: auto;
+  background: none;
+  border: none;
+  color: rgba(255,255,255,0.4);
+  cursor: pointer;
+  padding: 2px;
+  display: flex;
+  align-items: center;
+  border-radius: 4px;
+}
+.pickerClear:hover { color: #fff; background: rgba(255,255,255,0.06); }
+
+.pickerDropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  background: #14253c;
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 8px;
+  max-height: 260px;
+  overflow-y: auto;
+  z-index: 100;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+}
+.pickerOption {
+  width: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 9px 12px;
+  background: none;
+  border: none;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+  text-align: left;
+  cursor: pointer;
+  color: #fff;
+  font-family: inherit;
+  font-size: 12.5px;
+}
+.pickerOption:last-child { border-bottom: none; }
+.pickerOption:hover { background: rgba(14,165,233,0.12); }
+.optIata { color: #0ea5e9; font-weight: 700; min-width: 32px; }
+.optName { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.optMeta { color: rgba(255,255,255,0.45); font-size: 11px; white-space: nowrap; }
+
+.pickerHint {
+  font-size: 10.5px;
+  color: rgba(14,165,233,0.7);
+  margin-top: 5px;
+  padding-left: 4px;
+  font-style: italic;
+}
+
+/* ── Trip type toggle ────────────────────────────────────────────────────── */
+.tripTypeRow {
+  display: flex;
+  gap: 6px;
+  margin-top: 18px;
+  background: rgba(255,255,255,0.04);
+  border-radius: 8px;
+  padding: 3px;
+}
+.tripBtn {
+  flex: 1;
+  background: none;
+  border: none;
+  color: rgba(255,255,255,0.6);
+  padding: 7px 0;
+  font-size: 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background 0.15s, color 0.15s;
+}
+.tripBtnActive {
+  background: rgba(14,165,233,0.18);
+  color: #38bdf8;
+  font-weight: 600;
+}
+
+/* ── Date inputs ─────────────────────────────────────────────────────────── */
+.dateRow {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+.dateField {
+  flex: 1;
+}
+.dateField label {
+  display: block;
+  font-size: 10px;
+  color: rgba(255,255,255,0.5);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  margin-bottom: 6px;
+}
+.dateField input {
+  width: 100%;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px;
+  padding: 9px 10px;
+  color: #fff;
+  font-family: inherit;
+  font-size: 12.5px;
+  color-scheme: dark;
+}
+.dateField input:focus {
+  outline: none;
+  border-color: #0ea5e9;
+}
+
+/* ── Stops selector ──────────────────────────────────────────────────────── */
+.stopsRow {
+  margin-top: 14px;
+}
+.stopsLabel {
+  display: block;
+  font-size: 10px;
+  color: rgba(255,255,255,0.5);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  margin-bottom: 6px;
+}
+.stopsChips {
+  display: flex;
+  gap: 6px;
+}
+.chip {
+  flex: 1;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 8px;
+  padding: 8px 0;
+  color: rgba(255,255,255,0.7);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.chip:hover { background: rgba(255,255,255,0.07); }
+.chipActive {
+  background: rgba(14,165,233,0.15);
+  border-color: rgba(14,165,233,0.5);
+  color: #38bdf8;
+  font-weight: 600;
+}
+
+/* ── Section + route options ─────────────────────────────────────────────── */
+.section {
+  margin-top: 22px;
+}
+.sectionTitle {
+  font-size: 10px;
+  color: rgba(255,255,255,0.5);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  margin-bottom: 10px;
+}
+.routeList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.routeRow {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.07);
+  border-radius: 8px;
+  padding: 11px 12px;
+  cursor: pointer;
+  text-align: left;
+  font-family: inherit;
+  color: #fff;
+  transition: border-color 0.15s, background 0.15s;
+}
+.routeRow:hover { background: rgba(255,255,255,0.06); }
+.routeRowSelected {
+  background: rgba(14,165,233,0.08);
+  border-color: rgba(14,165,233,0.45);
+}
+.routeDot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-top: 5px;
+  flex-shrink: 0;
+  box-shadow: 0 0 0 2px rgba(255,255,255,0.1);
+}
+.routeBody { flex: 1; min-width: 0; }
+.routeHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.routeLabel {
+  font-size: 13px;
+  font-weight: 600;
+}
+.routePrice {
+  font-size: 14px;
+  font-weight: 700;
+  color: #fff;
+}
+.routeMeta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: rgba(255,255,255,0.55);
+  margin-top: 3px;
+}
+.routeMetaDot { opacity: 0.5; }
+
+/* ── Manual intermediate stops (when user forces a stop) ─────────────────── */
+.manualStopRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  background: rgba(255,255,255,0.03);
+  border: 1px dashed rgba(255,255,255,0.12);
+  border-radius: 8px;
+  margin-bottom: 6px;
+}
+.manualStopDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #a855f7;
+  flex-shrink: 0;
+}
+.manualStopBody {
+  flex: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.manualStopIata { color: #a855f7; font-weight: 700; font-size: 12.5px; }
+.manualStopMeta { color: rgba(255,255,255,0.55); font-size: 12px; }
+.manualStopRemove {
+  background: none;
+  border: none;
+  color: rgba(255,255,255,0.4);
+  cursor: pointer;
+  padding: 2px;
+  display: flex;
+  align-items: center;
+  border-radius: 4px;
+}
+.manualStopRemove:hover { color: #fff; }
+.manualHint {
+  font-size: 11px;
+  color: rgba(255,255,255,0.45);
+  font-style: italic;
+  margin-top: 6px;
+  padding-left: 4px;
+}
+
+/* ── Empty state ─────────────────────────────────────────────────────────── */
+.empty {
+  margin-top: 30px;
+  padding: 20px 14px;
+  background: rgba(255,255,255,0.03);
+  border-radius: 10px;
+  text-align: center;
+}
+.emptyTitle {
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(255,255,255,0.85);
+  margin-bottom: 6px;
+}
+.emptyText {
+  font-size: 12px;
+  color: rgba(255,255,255,0.5);
+  line-height: 1.5;
+}
+
+/* ── CTA ─────────────────────────────────────────────────────────────────── */
+.cta {
+  padding: 16px 18px;
+  border-top: 1px solid rgba(255,255,255,0.06);
+}
+.searchBtn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: linear-gradient(180deg, #ff7a45 0%, #ff6b35 100%);
+  border: none;
+  border-radius: 10px;
+  padding: 13px;
+  color: #fff;
+  font-family: inherit;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.15s, opacity 0.15s;
+}
+.searchBtn:hover { opacity: 0.92; transform: translateY(-1px); }
+.searchBtn:active { transform: translateY(0); }
+.searchBtn:disabled { opacity: 0.7; cursor: wait; transform: none; }
+
+.spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255,255,255,0.35);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }

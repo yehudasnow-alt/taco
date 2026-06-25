@@ -1,0 +1,183 @@
+// Algorithmic multi-stop route finder. Given an origin, destination, and a
+// stops budget, returns a small set of plausible routes (direct + 1-stop +
+// 2-stop options through major hubs). Pricing is a placeholder until a real
+// flight API (Duffel/Amadeus) is wired in.
+
+const R_EARTH_KM = 6371;
+
+export function distanceKm(a, b) {
+  const r = Math.PI / 180;
+  const φ1 = a.lat * r, φ2 = b.lat * r;
+  const dφ = (b.lat - a.lat) * r;
+  const dλ = (b.lng - a.lng) * r;
+  const x = Math.sin(dφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(dλ / 2) ** 2;
+  return R_EARTH_KM * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
+}
+
+// Color palette: direct route is signature orange so it's instantly
+// recognisable; alternatives cycle through a small accessible palette.
+const PALETTE = [
+  '#ff6b35', // direct — orange
+  '#22c55e', // green
+  '#a855f7', // purple
+  '#3b82f6', // blue
+  '#f59e0b', // amber
+];
+
+// Pricing: distance × per-km rate, with a small multi-stop discount and a
+// round-trip multiplier. Heuristic only.
+function priceFor(km, stops, tripType) {
+  const base   = km * 0.12; // $0.12/km
+  const stopOff = Math.min(0.30, stops * 0.10);
+  const tripMul = tripType === 'roundtrip' ? 1.7 : 1.0;
+  return Math.round(base * (1 - stopOff) * tripMul);
+}
+
+// Travel time: ~880 km/h cruise + 1h overhead per flight + 1.5h per layover.
+function hoursFor(km, stops) {
+  return (km / 880) + (stops + 1) * 1 + stops * 1.5;
+}
+
+export function fmtDuration(hours) {
+  const h = Math.floor(hours);
+  const m = Math.round((hours - h) * 60);
+  return `${h}h ${m.toString().padStart(2, '0')}m`;
+}
+
+// Pick top-k candidates while enforcing geographic diversity (no two hubs
+// closer than minSepKm to each other) — keeps the suggestions visually
+// distinct on the globe instead of returning three near-identical paths.
+function pickDiverseHubs(sortedCandidates, k, minSepKm) {
+  const out = [];
+  for (const c of sortedCandidates) {
+    if (out.every(o => distanceKm(o.hub, c.hub) >= minSepKm)) {
+      out.push(c);
+      if (out.length >= k) break;
+    }
+  }
+  return out;
+}
+
+export function generateRoutes({ origin, destination, maxStops, tripType, allAirports }) {
+  if (!origin || !destination) return [];
+  if (origin.iata === destination.iata) return [];
+
+  const directDist = distanceKm(origin, destination);
+  const routes = [];
+
+  // Direct flight — always included.
+  routes.push({
+    id: 'direct',
+    label: 'Direct',
+    color: PALETTE[0],
+    stops: [origin, destination],
+    distanceKm: directDist,
+    durationHours: hoursFor(directDist, 0),
+    price: priceFor(directDist, 0, tripType),
+    stopCount: 0,
+  });
+
+  const cap = maxStops === 'any' ? 2 : maxStops;
+
+  // ── 1-stop alternatives ──────────────────────────────────────────────────
+  if (cap >= 1) {
+    const candidates = allAirports
+      .filter(a =>
+        a.tier <= 1 &&
+        a.iata !== origin.iata && a.iata !== destination.iata &&
+        // Prune: both legs must be within reach of direct distance.
+        distanceKm(origin, a) <= directDist * 1.0 &&
+        distanceKm(a, destination) <= directDist * 1.0
+      )
+      .map(hub => ({
+        hub,
+        total: distanceKm(origin, hub) + distanceKm(hub, destination),
+      }))
+      .filter(o => (o.total / directDist) <= 1.45) // accept up to 45% detour
+      .sort((a, b) => a.total - b.total);
+
+    pickDiverseHubs(candidates, 2, 1200).forEach((opt, i) => {
+      routes.push({
+        id: `1s-${opt.hub.iata}`,
+        label: `via ${opt.hub.iata}`,
+        color: PALETTE[i + 1],
+        stops: [origin, opt.hub, destination],
+        distanceKm: opt.total,
+        durationHours: hoursFor(opt.total, 1),
+        price: priceFor(opt.total, 1, tripType),
+        stopCount: 1,
+      });
+    });
+  }
+
+  // ── 2-stop alternatives ──────────────────────────────────────────────────
+  if (cap >= 2) {
+    // Restrict to tier-0 hubs for the 2-stop search so the O(N²) pair loop
+    // stays cheap (~235² = 55k pairs).
+    const hubs = allAirports.filter(a =>
+      a.tier === 0 &&
+      a.iata !== origin.iata && a.iata !== destination.iata
+    );
+
+    const pairs = [];
+    for (let i = 0; i < hubs.length; i++) {
+      const h1 = hubs[i];
+      const d1 = distanceKm(origin, h1);
+      if (d1 > directDist * 0.95) continue;
+      for (let j = 0; j < hubs.length; j++) {
+        if (i === j) continue;
+        const h2 = hubs[j];
+        const d3 = distanceKm(h2, destination);
+        if (d3 > directDist * 0.95) continue;
+        const d2 = distanceKm(h1, h2);
+        const total = d1 + d2 + d3;
+        if ((total / directDist) > 1.70) continue;
+        pairs.push({ h1, h2, total });
+      }
+    }
+    pairs.sort((a, b) => a.total - b.total);
+
+    // Pick 1-2 most diverse 2-stop routes (no hub repeated across picks)
+    const used = new Set();
+    let picked = 0;
+    for (const p of pairs) {
+      if (used.has(p.h1.iata) || used.has(p.h2.iata)) continue;
+      routes.push({
+        id: `2s-${p.h1.iata}-${p.h2.iata}`,
+        label: `via ${p.h1.iata} · ${p.h2.iata}`,
+        color: PALETTE[picked + 3],
+        stops: [origin, p.h1, p.h2, destination],
+        distanceKm: p.total,
+        durationHours: hoursFor(p.total, 2),
+        price: priceFor(p.total, 2, tripType),
+        stopCount: 2,
+      });
+      used.add(p.h1.iata);
+      used.add(p.h2.iata);
+      picked++;
+      if (picked >= 2) break;
+    }
+  }
+
+  return routes;
+}
+
+// Build a single manual route from explicit user-chosen intermediates.
+// Used when the algorithm should yield to a user's specific plan.
+export function buildManualRoute({ origin, destination, intermediates, tripType }) {
+  const stops = [origin, ...intermediates, destination].filter(Boolean);
+  if (stops.length < 2) return null;
+  let total = 0;
+  for (let i = 0; i < stops.length - 1; i++) total += distanceKm(stops[i], stops[i + 1]);
+  const stopCount = stops.length - 2;
+  return {
+    id: 'manual',
+    label: stopCount === 0 ? 'Direct (manual)' : `${stopCount} stop${stopCount > 1 ? 's' : ''} (manual)`,
+    color: '#ff6b35',
+    stops,
+    distanceKm: total,
+    durationHours: hoursFor(total, stopCount),
+    price: priceFor(total, stopCount, tripType),
+    stopCount,
+  };
+}

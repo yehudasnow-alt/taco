@@ -1,15 +1,16 @@
 import { useRef, useEffect, useMemo } from 'react';
 import mapboxgl from 'mapbox-gl';
 import 'mapbox-gl/dist/mapbox-gl.css';
-import { useRouteStore } from '../store/routeStore';
+import { useRouteStore, selectedStopIatas } from '../store/routeStore';
 import { useAirports } from '../hooks/useAirports';
+import { generateRoutes, buildManualRoute } from '../utils/routeFinder';
 
 mapboxgl.accessToken =
   import.meta.env.VITE_MAPBOX_TOKEN ||
   'pk.eyJ1IjoibWFwYm94IiwiYSI6ImNpejY4NXVycTA2emYycXBndHRqcmZ3N3gifQ.rJcFIG214AriISLbB6B5aw';
 
-// ── Great-circle arc (densified for smooth visual curve) ──────────────────────
-function gcArc(from, to, n = 80) {
+// ── Great-circle arc ──────────────────────────────────────────────────────────
+function gcArc(from, to, n = 96) {
   const r = Math.PI / 180, D = 180 / Math.PI;
   const la1 = from.lat * r, lo1 = from.lng * r;
   const la2 = to.lat   * r, lo2 = to.lng   * r;
@@ -29,8 +30,18 @@ function gcArc(from, to, n = 80) {
 
 const easeInOutCubic = t => t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 
-// Hide street/POI/internal-admin clutter from any Mapbox style. Keeps water,
-// land, terrain shading, country borders, and major place labels.
+// True if the given lng/lat is on the camera-facing side of the globe.
+// Uses 3D unit-sphere dot product against the map center direction.
+function visibleFromCenter(lng, lat, cLng, cLat) {
+  const r = Math.PI / 180;
+  const pLa = lat * r, pLo = lng * r;
+  const cLa = cLat * r, cLo = cLng * r;
+  const dot =
+    Math.cos(pLa) * Math.cos(cLa) * Math.cos(pLo - cLo) +
+    Math.sin(pLa) * Math.sin(cLa);
+  return dot > 0.05; // small buffer so we don't draw points right at the horizon
+}
+
 function declutter(map) {
   const layers = map.getStyle()?.layers || [];
   const hide = [
@@ -41,7 +52,7 @@ function declutter(map) {
     /natural-line-label/i, /natural-point-label/i,
     /water-line-label/i, /water-point-label/i,
     /settlement-minor-label/i, /settlement-subdivision-label/i,
-    /airport-label/i, // we draw our own
+    /airport-label/i,
   ];
   layers.forEach(layer => {
     if (hide.some(p => p.test(layer.id))) {
@@ -56,16 +67,25 @@ export default function Globe() {
   const mapRef       = useRef(null);
   const rafRef       = useRef(null);
   const idleRef      = useRef(null);
-  const stopsRef     = useRef([]);
   const interactingRef = useRef(false);
 
   const spinRef = useRef({ factor: 0, from: 0, target: 1, start: 0, dur: 1500 });
 
-  const { airports, loading } = useAirports();
-  const { stops, addStop, hoveredAirport, setHoveredAirport } = useRouteStore();
-  stopsRef.current = stops;
+  const { airports } = useAirports();
+  const store = useRouteStore();
+  const {
+    origin, destination, intermediates,
+    maxStops, tripType,
+    routeOptions, selectedRouteId,
+    hoveredAirport, setHoveredAirport,
+    pickAirport, setRouteOptions, selectRoute,
+  } = store;
 
-  // GeoJSON regenerates whenever the airports dataset updates (CSV finishes loading).
+  // Refs that animation/render handlers read — avoid stale closures.
+  const stateRef = useRef(store);
+  stateRef.current = store;
+
+  // GeoJSON regenerates whenever the airports dataset updates.
   const airportGeoJSON = useMemo(() => ({
     type: 'FeatureCollection',
     features: airports.map(a => ({
@@ -92,47 +112,113 @@ export default function Globe() {
     return s.factor;
   };
 
-  // ── Render SVG arc overlay (direct DOM for perf during map moves) ───────────
+  // ── Render route arcs as SVG overlay ────────────────────────────────────────
+  // For each route, we walk its great-circle path one point at a time:
+  //   (1) skip points hidden behind the globe (hemisphere check)
+  //   (2) project visible points to screen space
+  //   (3) lift each point outward radially from the globe's screen center
+  //       blended with a touch of straight-up so arcs near the centre still
+  //       rise visibly. Magnitude follows sin(progress·π).
+  // Visible runs become SVG sub-paths so the arc disappears cleanly when it
+  // wraps behind the globe and re-emerges later.
   const renderArcs = () => {
     const map = mapRef.current;
     const svg = svgRef.current;
     if (!map || !svg) return;
-    const stops = stopsRef.current;
 
-    if (stops.length < 2) { svg.innerHTML = ''; return; }
+    const { routeOptions, selectedRouteId, origin, destination, intermediates, tripType } = stateRef.current;
 
-    const segments = [];
-    for (let i = 0; i < stops.length - 1; i++) {
-      const from = stops[i];
-      const to   = stops[i + 1];
-      const pts  = gcArc(from, to, 80);
-      const proj = pts.map(([lng, lat]) => {
-        const p = map.project([lng, lat]);
-        return [p.x, p.y];
-      });
-      const dx = proj[proj.length - 1][0] - proj[0][0];
-      const dy = proj[proj.length - 1][1] - proj[0][1];
-      const screenDist = Math.hypot(dx, dy);
-      const peakLift   = Math.min(Math.max(screenDist * 0.18, 30), 320);
-      const path = proj.map(([x, y], j) => {
-        const t = j / (proj.length - 1);
-        const lift = Math.sin(t * Math.PI) * peakLift;
-        return (j === 0 ? 'M' : 'L') + x.toFixed(1) + ' ' + (y - lift).toFixed(1);
-      }).join(' ');
-      segments.push(path);
+    // Choose what to draw: algorithmic route options, or the manual route, or nothing.
+    let routesToDraw = routeOptions;
+    if (routesToDraw.length === 0) {
+      const manual = buildManualRoute({ origin, destination, intermediates, tripType });
+      if (manual) routesToDraw = [{ ...manual, id: 'manual' }];
     }
 
-    svg.innerHTML = `
+    if (routesToDraw.length === 0) { svg.innerHTML = ''; return; }
+
+    const center = map.getCenter();
+    const centerScreen = map.project([center.lng, center.lat]);
+    const cx = centerScreen.x, cy = centerScreen.y;
+
+    // Sort so the selected route is drawn last (on top).
+    const sorted = [...routesToDraw].sort((a, b) => {
+      const aSel = a.id === selectedRouteId ? 1 : 0;
+      const bSel = b.id === selectedRouteId ? 1 : 0;
+      return aSel - bSel;
+    });
+
+    const RADIAL_WEIGHT   = 0.65; // 65% radial + 35% straight-up = arcs lift naturally
+    const VERTICAL_WEIGHT = 1 - RADIAL_WEIGHT;
+
+    let svgContent = `
       <defs>
         <filter id="arcGlow" x="-50%" y="-50%" width="200%" height="200%">
           <feGaussianBlur stdDeviation="4" />
         </filter>
       </defs>
-      ${segments.map(d => `
-        <path d="${d}" fill="none" stroke="#ff6b35" stroke-opacity="0.35" stroke-width="9" filter="url(#arcGlow)" />
-        <path d="${d}" fill="none" stroke="#ff6b35" stroke-width="2.6" stroke-linecap="round" />
-      `).join('')}
     `;
+
+    for (const route of sorted) {
+      const isSelected = route.id === selectedRouteId;
+      const opacity    = isSelected ? 1 : 0.45;
+      const widthMain  = isSelected ? 3.2 : 2.2;
+      const widthGlow  = isSelected ? 10  : 6;
+
+      const segmentPaths = [];
+
+      for (let segI = 0; segI < route.stops.length - 1; segI++) {
+        const from = route.stops[segI];
+        const to   = route.stops[segI + 1];
+
+        const fromScreen = map.project([from.lng, from.lat]);
+        const toScreen   = map.project([to.lng,   to.lat]);
+        const screenDist = Math.hypot(toScreen.x - fromScreen.x, toScreen.y - fromScreen.y);
+        const peakLift   = Math.min(Math.max(screenDist * 0.20, 35), 340);
+
+        const pts = gcArc(from, to, 96);
+
+        let pathStr = '';
+        let inSeg = false;
+        for (let j = 0; j < pts.length; j++) {
+          const [lng, lat] = pts[j];
+          if (!visibleFromCenter(lng, lat, center.lng, center.lat)) {
+            inSeg = false;
+            continue;
+          }
+          const screen = map.project([lng, lat]);
+          const t = j / (pts.length - 1);
+          const lift = Math.sin(t * Math.PI) * peakLift;
+
+          // Direction: outward from globe centre in screen space.
+          const rdx = screen.x - cx, rdy = screen.y - cy;
+          const rlen = Math.hypot(rdx, rdy);
+          const ux_r = rlen > 1 ? rdx / rlen : 0;
+          const uy_r = rlen > 1 ? rdy / rlen : -1;
+
+          // Blend with straight-up so arcs over the centre of view still rise.
+          const bx = ux_r * RADIAL_WEIGHT + 0  * VERTICAL_WEIGHT;
+          const by = uy_r * RADIAL_WEIGHT + -1 * VERTICAL_WEIGHT;
+          const blen = Math.hypot(bx, by);
+          const ux = blen > 0 ? bx / blen : 0;
+          const uy = blen > 0 ? by / blen : -1;
+
+          const x = screen.x + ux * lift;
+          const y = screen.y + uy * lift;
+
+          pathStr += (inSeg ? 'L' : 'M') + ' ' + x.toFixed(1) + ' ' + y.toFixed(1) + ' ';
+          inSeg = true;
+        }
+        if (pathStr) segmentPaths.push(pathStr);
+      }
+
+      segmentPaths.forEach(d => {
+        svgContent += `<path d="${d}" fill="none" stroke="${route.color}" stroke-opacity="${0.35 * opacity}" stroke-width="${widthGlow}" filter="url(#arcGlow)" />`;
+        svgContent += `<path d="${d}" fill="none" stroke="${route.color}" stroke-opacity="${opacity}" stroke-width="${widthMain}" stroke-linecap="round" />`;
+      });
+    }
+
+    svg.innerHTML = svgContent;
   };
 
   // ── Init map (once) ─────────────────────────────────────────────────────────
@@ -141,7 +227,7 @@ export default function Globe() {
 
     const map = new mapboxgl.Map({
       container: containerRef.current,
-      style:      'mapbox://styles/mapbox/outdoors-v12',  // natural colors: sea, green land, beige desert
+      style:      'mapbox://styles/mapbox/outdoors-v12',
       projection: 'globe',
       zoom:       1.8,
       center:     [15, 20],
@@ -156,8 +242,9 @@ export default function Globe() {
     let prev = null;
     const frame = (ts) => {
       const factor = tickSpin(ts);
+      const noStops = !stateRef.current.origin && !stateRef.current.destination;
       if (prev !== null && factor > 0.001 && !interactingRef.current
-          && !map.isMoving() && stopsRef.current.length === 0) {
+          && !map.isMoving() && noStops) {
         const dt   = ts - prev;
         const zoom = map.getZoom();
         const zoomScale = Math.max(0, Math.min(1, (3.5 - zoom) / 2));
@@ -183,15 +270,14 @@ export default function Globe() {
         'star-intensity': 0.45,
       });
 
-      // Use the current airports state (might be initial or already-loaded CSV)
       map.addSource('airports', { type: 'geojson', data: airportGeoJSON });
 
-      // ── Tier 0 — country primary, always visible ──────────────────────────
+      // ── Tier 0 (country primary): bold blue, glow, always visible ─────────
       map.addLayer({
         id: 'ap-t0-glow', type: 'circle', source: 'airports',
         filter: ['==', ['get', 'tier'], 0],
         paint: {
-          'circle-radius':  ['interpolate', ['linear'], ['zoom'], 1, 9,  4, 13, 8, 18],
+          'circle-radius':  ['interpolate', ['linear'], ['zoom'], 1, 9, 4, 13, 8, 18],
           'circle-color':   '#0ea5e9',
           'circle-opacity': 0.28,
           'circle-blur':    0.65,
@@ -209,58 +295,45 @@ export default function Globe() {
         },
       });
 
-      // ── Tier 1 — major airports + curated secondaries, from zoom 2.8 ──────
-      map.addLayer({
-        id: 'ap-t1-glow', type: 'circle', source: 'airports',
-        filter: ['==', ['get', 'tier'], 1],
-        paint: {
-          'circle-radius':  ['interpolate', ['linear'], ['zoom'], 3, 7, 8, 12],
-          'circle-color':   '#0ea5e9',
-          'circle-opacity': ['interpolate', ['linear'], ['zoom'], 2.6, 0, 3.6, 0.22],
-          'circle-blur':    0.7,
-        },
-      });
+      // ── Secondary tiers (1–3): white fill, blue outline, smaller. Hidden
+      //    until you zoom into a country (≥ 4.5 for major, ≥ 5.5 / 7 for the rest).
       map.addLayer({
         id: 'ap-t1', type: 'circle', source: 'airports',
         filter: ['==', ['get', 'tier'], 1],
         paint: {
-          'circle-radius':       ['interpolate', ['linear'], ['zoom'], 3, 3.5, 8, 5.5],
-          'circle-color':        '#38bdf8',
-          'circle-stroke-color': '#ffffff',
-          'circle-stroke-width': 1.6,
-          'circle-opacity':      ['interpolate', ['linear'], ['zoom'], 2.6, 0, 3.6, 1],
+          'circle-radius':       ['interpolate', ['linear'], ['zoom'], 4.5, 3, 9, 5],
+          'circle-color':        '#ffffff',
+          'circle-stroke-color': '#0ea5e9',
+          'circle-stroke-width': 1.8,
+          'circle-opacity':      ['interpolate', ['linear'], ['zoom'], 4.3, 0, 5.0, 1],
         },
       });
-
-      // ── Tier 2 — medium commercial airports, from zoom 4.5 ────────────────
       map.addLayer({
         id: 'ap-t2', type: 'circle', source: 'airports',
         filter: ['==', ['get', 'tier'], 2],
         paint: {
-          'circle-radius':       ['interpolate', ['linear'], ['zoom'], 4.5, 2.5, 9, 4.5],
-          'circle-color':        '#7dd3fc',
-          'circle-stroke-color': '#ffffff',
-          'circle-stroke-width': 1.2,
-          'circle-opacity':      ['interpolate', ['linear'], ['zoom'], 4.3, 0, 5.3, 0.95],
+          'circle-radius':       ['interpolate', ['linear'], ['zoom'], 5.5, 2.5, 9, 4],
+          'circle-color':        '#ffffff',
+          'circle-stroke-color': '#38bdf8',
+          'circle-stroke-width': 1.4,
+          'circle-opacity':      ['interpolate', ['linear'], ['zoom'], 5.3, 0, 6.0, 1],
         },
       });
-
-      // ── Tier 3 — small airports with scheduled service, from zoom 6.5 ─────
       map.addLayer({
         id: 'ap-t3', type: 'circle', source: 'airports',
         filter: ['==', ['get', 'tier'], 3],
         paint: {
-          'circle-radius':       ['interpolate', ['linear'], ['zoom'], 6.5, 2, 10, 3.5],
-          'circle-color':        '#bae6fd',
-          'circle-stroke-color': '#ffffff',
-          'circle-stroke-width': 1,
-          'circle-opacity':      ['interpolate', ['linear'], ['zoom'], 6.3, 0, 7.3, 0.9],
+          'circle-radius':       ['interpolate', ['linear'], ['zoom'], 7, 2, 10, 3.5],
+          'circle-color':        '#ffffff',
+          'circle-stroke-color': '#7dd3fc',
+          'circle-stroke-width': 1.2,
+          'circle-opacity':      ['interpolate', ['linear'], ['zoom'], 6.8, 0, 7.5, 1],
         },
       });
 
-      // ── Selected stops on top ─────────────────────────────────────────────
+      // ── Selected stops (orange, prominent, on top) ─────────────────────────
       map.addLayer({
-        id: 'ap-selected-glow', type: 'circle', source: 'airports',
+        id: 'ap-sel-glow', type: 'circle', source: 'airports',
         filter: ['in', ['get', 'iata'], ['literal', []]],
         paint: {
           'circle-radius':  ['interpolate', ['linear'], ['zoom'], 1, 14, 6, 22],
@@ -270,24 +343,23 @@ export default function Globe() {
         },
       });
       map.addLayer({
-        id: 'ap-selected', type: 'circle', source: 'airports',
+        id: 'ap-sel', type: 'circle', source: 'airports',
         filter: ['in', ['get', 'iata'], ['literal', []]],
         paint: {
           'circle-radius':       ['interpolate', ['linear'], ['zoom'], 1, 6.5, 6, 11],
           'circle-color':        '#ff6b35',
           'circle-stroke-color': '#ffffff',
           'circle-stroke-width': 2.5,
-          'circle-opacity':      1,
         },
       });
 
-      // ── IATA labels: tier-aware visibility, sort by tier so primaries win ─
+      // ── IATA labels: tier-aware visibility ────────────────────────────────
       map.addLayer({
         id: 'ap-label', type: 'symbol', source: 'airports',
         filter: ['any',
           ['==', ['get', 'tier'], 0],
-          ['all', ['==', ['get', 'tier'], 1], ['>=', ['zoom'], 4]],
-          ['all', ['==', ['get', 'tier'], 2], ['>=', ['zoom'], 5.5]],
+          ['all', ['==', ['get', 'tier'], 1], ['>=', ['zoom'], 5]],
+          ['all', ['==', ['get', 'tier'], 2], ['>=', ['zoom'], 6]],
           ['all', ['==', ['get', 'tier'], 3], ['>=', ['zoom'], 7.5]],
         ],
         layout: {
@@ -307,7 +379,8 @@ export default function Globe() {
         },
       });
 
-      if (stopsRef.current.length === 0) transitionSpin(1, 1800);
+      const empty = !stateRef.current.origin && !stateRef.current.destination;
+      if (empty) transitionSpin(1, 1800);
       renderArcs();
     });
 
@@ -321,11 +394,13 @@ export default function Globe() {
     };
     const onInteractEnd = () => {
       interactingRef.current = false;
-      if (stopsRef.current.length > 0) return;
+      const { origin, destination } = stateRef.current;
+      if (origin || destination) return;
       clearTimeout(idleRef.current);
       idleRef.current = setTimeout(() => {
-        if (interactingRef.current || stopsRef.current.length > 0) return;
-        transitionSpin(1, 1800);
+        if (interactingRef.current) return;
+        const s = stateRef.current;
+        if (!s.origin && !s.destination) transitionSpin(1, 1800);
       }, 2500);
     };
 
@@ -347,26 +422,28 @@ export default function Globe() {
       wheelEnd = setTimeout(onInteractEnd, 220);
     });
 
-    // Bind click + hover to every tier layer (so users can click the small dots too)
+    // Bind click + hover to every tier layer.
     ['ap-t0', 'ap-t1', 'ap-t2', 'ap-t3'].forEach(layer => {
       map.on('click', layer, e => {
         const p = e.features[0].properties;
-        addStop({
+        const airport = {
           iata: p.iata, name: p.name, city: p.city, country: p.country,
           lat: Number(p.lat), lng: Number(p.lng),
-        });
+        };
+        // Use a fresh getState call to avoid stale closure
+        stateRef.current.pickAirport(airport);
       });
       map.on('mouseenter', layer, e => {
         map.getCanvas().style.cursor = 'pointer';
         const p = e.features[0].properties;
-        setHoveredAirport({
+        stateRef.current.setHoveredAirport({
           iata: p.iata, name: p.name, city: p.city, country: p.country,
           primary: p.primary === true || p.primary === 'true',
         });
       });
       map.on('mouseleave', layer, () => {
         map.getCanvas().style.cursor = '';
-        setHoveredAirport(null);
+        stateRef.current.setHoveredAirport(null);
       });
     });
 
@@ -378,7 +455,7 @@ export default function Globe() {
     };
   }, []); // eslint-disable-line
 
-  // ── Update source whenever airports dataset grows (CSV finished loading) ────
+  // ── Refresh source when airports dataset grows ──────────────────────────────
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -386,13 +463,36 @@ export default function Globe() {
     map.isStyleLoaded() ? apply() : map.once('style.load', apply);
   }, [airportGeoJSON]);
 
-  // ── Sync selected highlight + arcs when stops change ────────────────────────
+  // ── Generate route options whenever the search params change ────────────────
+  useEffect(() => {
+    if (!origin || !destination) {
+      setRouteOptions([]);
+      selectRoute(null);
+      return;
+    }
+    if (intermediates.length > 0) {
+      // Manual override — the user has explicit stops; skip the algorithm
+      // and render exactly the manual route (built inside renderArcs).
+      setRouteOptions([]);
+      selectRoute(null);
+      return;
+    }
+    const opts = generateRoutes({
+      origin, destination,
+      maxStops, tripType,
+      allAirports: airports,
+    });
+    setRouteOptions(opts);
+    selectRoute(opts[0]?.id || null);
+  }, [origin, destination, intermediates, maxStops, tripType, airports]);  // eslint-disable-line
+
+  // ── Update selected highlight + redraw arcs when routes change ──────────────
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
     const apply = () => {
-      const iatas = stops.map(s => s.iata);
-      ['ap-selected', 'ap-selected-glow'].forEach(id => {
+      const iatas = selectedStopIatas(stateRef.current);
+      ['ap-sel', 'ap-sel-glow'].forEach(id => {
         map.setFilter?.(id, ['in', ['get', 'iata'], ['literal', iatas]]);
       });
       renderArcs();
@@ -400,12 +500,13 @@ export default function Globe() {
     map.isStyleLoaded() ? apply() : map.once('style.load', apply);
 
     clearTimeout(idleRef.current);
-    if (stops.length > 0) {
+    const hasRoute = !!(origin || destination);
+    if (hasRoute) {
       transitionSpin(0, 450);
     } else if (!interactingRef.current) {
       idleRef.current = setTimeout(() => transitionSpin(1, 1800), 800);
     }
-  }, [stops]); // eslint-disable-line
+  }, [origin, destination, intermediates, routeOptions, selectedRouteId]);  // eslint-disable-line
 
   return (
     <div style={{ width: '100%', height: '100%', position: 'relative' }}>
@@ -449,22 +550,6 @@ export default function Globe() {
         </div>
       )}
 
-      {/* Loading indicator while CSV downloads (first visit only — then localStorage). */}
-      {loading && (
-        <div style={{
-          position: 'absolute', top: 16, right: 20,
-          background: 'rgba(255,255,255,0.85)',
-          border: '1px solid rgba(0,0,0,0.06)',
-          borderRadius: 999, padding: '5px 12px',
-          color: '#555', fontSize: 11,
-          fontFamily: 'inherit', pointerEvents: 'none',
-          zIndex: 5,
-          boxShadow: '0 2px 8px rgba(0,0,0,0.06)',
-        }}>
-          Loading airports…
-        </div>
-      )}
-
       <div style={{
         position: 'absolute', bottom: 40, right: 20,
         color: 'rgba(30,30,30,0.55)', fontSize: 11,
@@ -474,7 +559,7 @@ export default function Globe() {
       }}>
         <span>Scroll to zoom · Drag to rotate</span>
         <span style={{ color: 'rgba(14,165,233,0.95)' }}>● Main hubs</span>
-        <span style={{ color: 'rgba(125,211,252,0.95)' }}>● Zoom in for more</span>
+        <span style={{ color: 'rgba(125,211,252,0.95)' }}>○ Zoom in for more</span>
       </div>
     </div>
   );

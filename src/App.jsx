@@ -1,11 +1,11 @@
 import Globe from './components/Globe';
-import RouteSidebar from './components/RouteSidebar';
+import SearchPanel from './components/SearchPanel';
 import './App.css';
 
 export default function App() {
   return (
     <div className="app">
-      <RouteSidebar />
+      <SearchPanel />
       <div className="globe-container">
         <Globe />
       </div>
