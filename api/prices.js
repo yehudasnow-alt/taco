@@ -1,14 +1,23 @@
 // Vercel Edge Function — server-side proxy to the Aviasales Data API.
 //
-// Why: the API token must never appear in browser-side code. The browser hits
-// our own /api/prices endpoint; we read the token from a Vercel Environment
-// Variable, call Travelpayouts, and return only the price data the UI needs.
+// Strategy: try v2/prices/latest first (broadest data, returns recent prices
+// from anywhere in the network), then fall back to v1/prices/cheap if v2
+// returns nothing. This dual-source approach catches the majority of routes
+// — including less-popular ones like TLV→NRT — where a single endpoint may
+// have stale or no cached prices.
+//
+// The token never appears in browser code. It's read from a Vercel Environment
+// Variable and only used in server-side fetch calls.
 //
 // Endpoint: GET /api/prices?origin=TLV&destination=NRT
-// Returns:  { direct: 612, oneStop: 540, twoStop: 480, currency: 'USD', source: 'aviasales' }
-//
-// In-memory cache (1 hour) survives across warm invocations within the same
-// Edge worker instance — keeps us well under any unstated rate limits.
+// Returns:  {
+//   direct:  { price: 612, airline: 'SU', depart_date: '2026-08-15' } | null,
+//   oneStop: { price: 480, airline: 'TK', depart_date: '2026-08-15' } | null,
+//   twoStop: { price: 425, airline: '...', depart_date: '...' } | null,
+//   currency: 'USD',
+//   source:   'aviasales-latest' | 'aviasales-cheap' | 'aviasales-mixed',
+//   ...
+// }
 
 export const config = { runtime: 'edge' };
 
@@ -31,6 +40,83 @@ function json(body, status = 200, extraHeaders = {}) {
       ...extraHeaders,
     },
   });
+}
+
+// ── Source 1: v2/prices/latest ───────────────────────────────────────────────
+// Best coverage — returns recent prices for the route across the whole network.
+// Response shape: { success, data: [ { value, origin, destination, gate,
+//   depart_date, number_of_changes, duration }, ... ] }
+async function fetchLatest(origin, destination, token) {
+  const url =
+    `https://api.travelpayouts.com/v2/prices/latest` +
+    `?currency=usd` +
+    `&origin=${origin}` +
+    `&destination=${destination}` +
+    `&period_type=year` +
+    `&page=1&limit=30` +
+    `&show_to_affiliates=true` +
+    `&sorting=price` +
+    `&one_way=true` +
+    `&token=${token}`;
+
+  const resp = await fetch(url, {
+    headers: { 'Accept-Encoding': 'gzip' },
+    signal: AbortSignal.timeout(6000),
+  });
+  if (!resp.ok) return null;
+
+  const body = await resp.json();
+  if (!body?.success || !Array.isArray(body.data) || body.data.length === 0) return null;
+
+  return body.data.map(d => ({
+    price:        d.value,
+    airline:      d.gate || null,
+    depart_date:  d.depart_date || null,
+    transfers:    Number(d.number_of_changes ?? 0),
+  }));
+}
+
+// ── Source 2: v1/prices/cheap ────────────────────────────────────────────────
+// Narrower — has the cheapest known by transfer count, but doesn't cover every
+// route. Useful as fallback when /latest returns nothing.
+async function fetchCheap(origin, destination, token) {
+  const url =
+    `https://api.travelpayouts.com/v1/prices/cheap` +
+    `?currency=usd` +
+    `&origin=${origin}` +
+    `&destination=${destination}` +
+    `&token=${token}`;
+
+  const resp = await fetch(url, {
+    headers: { 'Accept-Encoding': 'gzip' },
+    signal: AbortSignal.timeout(6000),
+  });
+  if (!resp.ok) return null;
+
+  const body = await resp.json();
+  if (!body?.success) return null;
+
+  const entries = Object.values(body.data?.[destination] || {});
+  if (entries.length === 0) return null;
+
+  return entries.map(d => ({
+    price:        d.price,
+    airline:      d.airline || null,
+    depart_date:  d.departure_at || null,
+    transfers:    Number(d.transfers ?? 0),
+  }));
+}
+
+// Pick cheapest entry matching the given transfer count (0=direct, 1, 2, ...)
+function cheapestByTransfers(rows, transfers) {
+  let best = null;
+  for (const r of rows) {
+    if (r.transfers !== transfers) continue;
+    if (!best || r.price < best.price) best = r;
+  }
+  return best
+    ? { price: best.price, airline: best.airline, depart_date: best.depart_date }
+    : null;
 }
 
 export default async function handler(req) {
@@ -61,56 +147,46 @@ export default async function handler(req) {
   }
 
   try {
-    // v1 "cheap" endpoint — returns the cheapest known flight for each
-    // transfer count (0, 1, 2) over a recent window. Best fit for our
-    // "show indicative prices on the globe" use case.
-    const apiUrl =
-      `https://api.travelpayouts.com/v1/prices/cheap` +
-      `?origin=${origin}&destination=${destination}` +
-      `&currency=usd&token=${token}`;
+    // Try both sources in parallel — even if /latest has data, /cheap might
+    // have a better transfer-count match. Merging both gives the best coverage.
+    const [latestRows, cheapRows] = await Promise.allSettled([
+      fetchLatest(origin, destination, token),
+      fetchCheap(origin, destination, token),
+    ]).then(results => results.map(r => r.status === 'fulfilled' ? r.value : null));
 
-    const resp = await fetch(apiUrl, {
-      headers: { 'Accept-Encoding': 'gzip' },
-      // 6-second budget — well under Vercel's 25s default for edge
-      signal: AbortSignal.timeout(6000),
-    });
+    const allRows = [
+      ...(latestRows || []),
+      ...(cheapRows  || []),
+    ];
 
-    if (!resp.ok) {
-      return json({ error: `Travelpayouts returned ${resp.status}` }, 502);
+    if (allRows.length === 0) {
+      // Cache the empty result for a shorter time so we re-check sooner.
+      const empty = {
+        direct: null, oneStop: null, twoStop: null,
+        currency: 'USD', source: 'aviasales-empty',
+        origin, destination,
+        fetched_at: new Date().toISOString(),
+        debug: 'Both endpoints returned no data — Aviasales has no cached prices for this route right now.',
+      };
+      cache.set(cacheKey, { data: empty, timestamp: Date.now() - CACHE_TTL_MS + 5 * 60 * 1000 });
+      return json(empty, 200, { 'X-Cache': 'MISS', 'X-Source': 'empty' });
     }
-
-    const body = await resp.json();
-    if (!body?.success) {
-      return json({ error: 'Travelpayouts returned no data', raw: body }, 502);
-    }
-
-    // Response shape: { data: { [destination]: { "0": {...}, "1": {...} } } }
-    // Each entry has fields: price, airline, flight_number, transfers,
-    // departure_at, return_at, expires_at.
-    const flights = Object.values(body.data?.[destination] || {});
-
-    // For each transfer count, pick the cheapest entry seen.
-    const cheapestBy = (transfers) =>
-      flights
-        .filter(f => f.transfers === transfers)
-        .reduce((min, f) => (min == null || f.price < min.price ? f : min), null);
-
-    const d  = cheapestBy(0);
-    const s1 = cheapestBy(1);
-    const s2 = cheapestBy(2);
 
     const result = {
-      direct:   d  ? { price: d.price,  airline: d.airline,  departure_at: d.departure_at  } : null,
-      oneStop:  s1 ? { price: s1.price, airline: s1.airline, departure_at: s1.departure_at } : null,
-      twoStop:  s2 ? { price: s2.price, airline: s2.airline, departure_at: s2.departure_at } : null,
+      direct:   cheapestByTransfers(allRows, 0),
+      oneStop:  cheapestByTransfers(allRows, 1),
+      twoStop:  cheapestByTransfers(allRows, 2),
       currency: 'USD',
-      source:   'aviasales',
+      source:   latestRows && cheapRows ? 'aviasales-mixed'
+              : latestRows               ? 'aviasales-latest'
+                                          : 'aviasales-cheap',
       origin, destination,
       fetched_at: new Date().toISOString(),
+      total_rows: allRows.length,
     };
 
     cache.set(cacheKey, { data: result, timestamp: Date.now() });
-    return json(result, 200, { 'X-Cache': 'MISS' });
+    return json(result, 200, { 'X-Cache': 'MISS', 'X-Source': result.source });
   } catch (err) {
     return json({ error: 'Upstream fetch failed', message: String(err) }, 502);
   }
