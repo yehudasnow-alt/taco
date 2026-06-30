@@ -3,7 +3,8 @@ import mapboxgl from 'mapbox-gl';
 import 'mapbox-gl/dist/mapbox-gl.css';
 import { useRouteStore, selectedStopIatas } from '../store/routeStore';
 import { useAirports } from '../hooks/useAirports';
-import { generateRoutes, buildManualRoute } from '../utils/routeFinder';
+import { generateRoutes, buildManualRoute, applyRealPrices } from '../utils/routeFinder';
+import { fetchPrices } from '../utils/travelpayouts';
 
 mapboxgl.accessToken =
   import.meta.env.VITE_MAPBOX_TOKEN ||
@@ -424,7 +425,12 @@ export default function Globe() {
     map.isStyleLoaded() ? apply() : map.once('style.load', apply);
   }, [airportGeoJSON]);
 
-  // Algorithmic route generation
+  // Algorithmic route generation + async overlay of real Aviasales prices.
+  // Step 1 (sync): heuristic algorithm produces routes with estimated prices.
+  // Step 2 (async): hit our /api/prices Edge Function for real cached prices
+  //                  and replace the estimates. If the fetch fails or returns
+  //                  no data for some stop counts, those routes keep their
+  //                  estimate — UI never shows an empty price.
   useEffect(() => {
     if (!origin || !destination) {
       setRouteOptions([]);
@@ -444,6 +450,18 @@ export default function Globe() {
     });
     setRouteOptions(opts);
     selectRoute(opts[0]?.id || null);
+
+    // Kick off the real-price fetch. Wrapped in a "cancelled" guard so a
+    // rapid sequence of origin/destination changes doesn't stomp later state.
+    let cancelled = false;
+    fetchPrices(origin.iata, destination.iata).then(prices => {
+      if (cancelled || !prices) return;
+      const updated = applyRealPrices(opts, prices, tripType);
+      // Only push if something actually changed to avoid unnecessary re-render.
+      const changed = updated.some((r, i) => r.price !== opts[i].price);
+      if (changed) setRouteOptions(updated);
+    });
+    return () => { cancelled = true; };
   }, [origin, destination, intermediates, maxStops, tripType, airports]); // eslint-disable-line
 
   // Update selected highlight + redraw arcs when routes/selection change

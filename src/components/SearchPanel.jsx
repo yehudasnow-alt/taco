@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useRouteStore } from '../store/routeStore';
 import { fmtDuration } from '../utils/routeFinder';
+import { buildBookingUrl } from '../utils/travelpayouts';
 import AirportPicker from './AirportPicker';
 import styles from './SearchPanel.module.css';
 
@@ -25,7 +26,11 @@ function RouteOptionRow({ route, isSelected, onClick }) {
       <div className={styles.routeBody}>
         <div className={styles.routeHead}>
           <span className={styles.routeLabel}>{route.label}</span>
-          <span className={styles.routePrice}>${route.price}</span>
+          <span className={styles.routePrice}>
+            {route.isRealPrice
+              ? <>from <strong>${route.price}</strong></>
+              : <>~${route.price}</>}
+          </span>
         </div>
         <div className={styles.routeMeta}>
           <span>{stopsText}</span>
@@ -33,6 +38,12 @@ function RouteOptionRow({ route, isSelected, onClick }) {
           <span>{fmtDuration(route.durationHours)}</span>
           <span className={styles.routeMetaDot}>·</span>
           <span>{Math.round(route.distanceKm).toLocaleString()} km</span>
+          {route.isRealPrice && (
+            <>
+              <span className={styles.routeMetaDot}>·</span>
+              <span className={styles.realPriceBadge}>live</span>
+            </>
+          )}
         </div>
       </div>
     </button>
@@ -78,21 +89,32 @@ export default function SearchPanel() {
 
   const handleSearchFlights = () => {
     setSearching(true);
+    // Pick the selected route's endpoints, falling back to origin/destination
+    // when the user hasn't explicitly picked from the algorithmic options.
+    const sel       = routeOptions.find(r => r.id === selectedRouteId) || routeOptions[0];
+    const endpoints = sel
+      ? { from: sel.stops[0], to: sel.stops[sel.stops.length - 1] }
+      : { from: origin,       to: destination };
+
+    if (!endpoints.from || !endpoints.to) {
+      setSearching(false);
+      return;
+    }
+
+    const url = buildBookingUrl({
+      origin:      endpoints.from.iata,
+      destination: endpoints.to.iata,
+      departDate:  departureDate || undefined,
+      returnDate:  tripType === 'roundtrip' ? (returnDate || undefined) : undefined,
+      adults:      1,
+    });
+
+    // Open in a new tab — keeps the user's Taco session warm for the next search.
+    // Small timeout so the spinner is visible long enough not to flash.
     setTimeout(() => {
       setSearching(false);
-      const sel = routeOptions.find(r => r.id === selectedRouteId) || routeOptions[0];
-      const routeStr = sel
-        ? sel.stops.map(s => s.iata).join(' → ') + `  ($${sel.price})`
-        : [origin, ...intermediates, destination].filter(Boolean).map(s => s.iata).join(' → ');
-      // eslint-disable-next-line no-alert
-      alert(
-        'Flight search is coming soon!\n\n' +
-        'Route: ' + routeStr + '\n' +
-        'Date: '  + (departureDate || 'not set') + (returnDate ? ' / ' + returnDate : '') + '\n' +
-        'Type: '  + tripType + '\n\n' +
-        'This will connect to the Duffel API to find real flights across airlines.'
-      );
-    }, 600);
+      window.open(url, '_blank', 'noopener,noreferrer');
+    }, 350);
   };
 
   return (
@@ -252,17 +274,20 @@ export default function SearchPanel() {
             {searching ? (
               <>
                 <span className={styles.spinner} />
-                Searching…
+                Opening search…
               </>
             ) : (
               <>
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" />
+                  <path d="M5 12h14M13 6l6 6-6 6" />
                 </svg>
-                Search flights
+                Book this route
               </>
             )}
           </button>
+          <div className={styles.ctaSub}>
+            Real-time prices from 1,200+ agencies via Aviasales
+          </div>
         </div>
       )}
     </aside>
