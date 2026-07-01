@@ -10,19 +10,31 @@ export const TRAVELPAYOUTS_MARKER = '744341';
 export const WHITE_LABEL_URL = 'https://flights.fly-taco.com';
 
 // ── Deep-link builder ────────────────────────────────────────────────────────
-// Aviasales URL format (used by the White Label too):
-//   /searches/{ORIGIN}{DDMM_DEPART}{DDMM_RETURN}{DESTINATION}{ADULTS}
-// e.g.  TLV1508NRT1        → one-way TLV→NRT on Aug 15, 1 adult
-//       TLV15082508NRT2    → round-trip TLV→NRT, Aug 15 / Aug 25, 2 adults
+// White Label Web URL format (per Travelpayouts docs referenced by support):
+//   /?flightSearch={ORIGIN}{DDMM_DEPART}{DESTINATION}{DDMM_RETURN}{CLASS}{ADULTS}[CHILDREN][INFANTS]
+// e.g.  TLV1508NRT1         → one-way TLV→NRT on Aug 15, economy, 1 adult
+//       TLV1508NRT2508c1    → round-trip Aug 15 / Aug 25, business, 1 adult
+//       MOW1607IST2007c321  → round-trip Moscow→Istanbul, business, 3 adults + 2 children + 1 infant
+//
+// Class char: empty = economy (default), 'c' = business, 'f' = first, 'w' = comfort.
+// Origin/destination MUST be 3-letter IATA in uppercase Latin letters.
+// A departure date is required for the search form to prefill; if none was
+// picked in Taco, we default to +30 days so the White Label still lands on
+// a real search page instead of the empty homepage.
 
 const pad2 = (n) => String(n).padStart(2, '0');
 
 function ddmm(isoDate) {
   if (!isoDate) return '';
-  // Accepts "YYYY-MM-DD" or Date
   const d = typeof isoDate === 'string' ? new Date(isoDate) : isoDate;
   if (isNaN(d.getTime())) return '';
   return pad2(d.getDate()) + pad2(d.getMonth() + 1);
+}
+
+function defaultFutureIsoDate(daysAhead = 30) {
+  const d = new Date();
+  d.setDate(d.getDate() + daysAhead);
+  return d.toISOString().slice(0, 10); // YYYY-MM-DD
 }
 
 export function buildBookingUrl({
@@ -30,18 +42,25 @@ export function buildBookingUrl({
   destination,
   departDate,
   returnDate,
-  adults = 1,
+  adults    = 1,
+  tripClass = '', // '' = economy, 'c' = business, 'f' = first, 'w' = comfort
 }) {
-  if (!origin || !destination) return WHITE_LABEL_URL;
+  if (!origin || !destination) {
+    return `${WHITE_LABEL_URL}/?marker=${TRAVELPAYOUTS_MARKER}`;
+  }
 
-  const path =
-    origin.toUpperCase() +
-    ddmm(departDate) +
-    ddmm(returnDate) +
+  const depart = departDate || defaultFutureIsoDate(30);
+  const clamped = Math.max(1, Math.min(9, Number(adults) || 1));
+
+  const flightSearch =
+    origin.toUpperCase()      +
+    ddmm(depart)              +
     destination.toUpperCase() +
-    Math.max(1, Math.min(9, adults));
+    (returnDate ? ddmm(returnDate) : '') +
+    (tripClass || '')         +
+    String(clamped);
 
-  return `${WHITE_LABEL_URL}/searches/${path}?marker=${TRAVELPAYOUTS_MARKER}`;
+  return `${WHITE_LABEL_URL}/?flightSearch=${flightSearch}&marker=${TRAVELPAYOUTS_MARKER}`;
 }
 
 // ── Price fetch from our own Edge Function ───────────────────────────────────
